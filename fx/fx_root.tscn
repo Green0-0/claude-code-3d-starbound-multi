@@ -1,0 +1,22 @@
+; Scene host for fx/. Instanced by main.tscn as the `FX` node.
+; Node names are part of the contract: fx_root.gd looks them up with $Particles,
+; $Weather and $Decals.
+
+[gd_scene load_steps=5 format=3]
+
+[ext_resource type="Script" path="res://fx/fx_root.gd" id="1_scr"]
+[ext_resource type="Script" path="res://fx/particles.gd" id="2_par"]
+[ext_resource type="Script" path="res://fx/weather_fx.gd" id="3_wea"]
+[ext_resource type="Script" path="res://fx/decals.gd" id="4_dec"]
+
+[node name="FX" type="Node3D"]
+script = ExtResource("1_scr")
+
+[node name="Particles" type="Node3D" parent="."]
+script = ExtResource("2_par")
+
+[node name="Weather" type="Node3D" parent="."]
+script = ExtResource("3_wea")
+
+[node name="Decals" type="Node3D" parent="."]
+script = ExtResource("4_dec")

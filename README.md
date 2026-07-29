@@ -54,10 +54,14 @@ key prompts from the live `InputMap`, so they stay correct after a rebind.
 ## Verifying a build
 
 ```
-godot --headless --import --path .              # compile everything
-godot --headless --path . tools/smoke_test.tscn # 20 integration assertions
-godot --headless --path . tools/perf_probe.tscn # chunk generation cost
+godot --headless --import --path .               # compile everything
+godot --headless --path . tools/smoke_test.tscn  # 20 integration assertions
+godot --headless --path . tools/save_test.tscn   # 12 persistence round-trips
+godot --path .              tools/playthrough.tscn # scripted play + screenshots
+godot --headless --path . tools/perf_probe.tscn  # chunk generation cost
 ```
+
+All four exit non-zero on failure, so any of them can gate a build.
 
 `tools/smoke_test.tscn` boots the real `main.tscn`, streams the world in, and
 asserts the things that must hold for the game to be playable: registries
@@ -65,7 +69,18 @@ filled, terrain generated, the player standing in free space on solid ground,
 and both halves of the perspective mechanic actually changing state (the flip
 advances the view index and swaps the depth axis without moving the player
 vertically; the shift advances the layer and leaves the player somewhere legal).
-It exits non-zero on failure, so it can gate a build.
+
+`tools/playthrough.tscn` needs a real renderer (it will not work headless). It
+drives a full session — walk, flip through all four planes, shift a layer, open
+every panel, travel to a planet, mine, build, fight, cycle day/night, save and
+reload — and writes a numbered PNG per beat into `screenshots/`, checking each
+frame actually contains rendered content rather than a blank buffer. Several
+bugs only reproduce under a live renderer, so this is the suite that matters
+most before shipping a change.
+
+`tools/save_test.tscn` runs the persistence module's own harness: codec round
+trips, corruption and truncation recovery, migration, region file reuse and
+compaction, and the atomic-write-plus-backup path.
 
 ### Known limitation
 

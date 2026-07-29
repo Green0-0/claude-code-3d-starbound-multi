@@ -1,0 +1,10 @@
+; Generic monster scene, so other modules can use the standard
+; `Game.spawn_entity("res://entities/monsters/monster.tscn", pos, {"species": &"..."})`
+; entry point. The spawn director instantiates `MobBase` directly instead.
+
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://entities/monsters/monster.gd" id="1_mob"]
+
+[node name="Monster" type="Node3D"]
+script = ExtResource("1_mob")

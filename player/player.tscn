@@ -1,0 +1,40 @@
+; The player actor. Instanced by main.tscn as the node named "Player".
+;
+; Node contract for other agents:
+;   Player        PlayerActor       movement, flip handling, item API
+;   Player/Visual PlayerVisual      the procedural paper doll
+;   Player/Input  PlayerInput       buffered, gate-able input intent
+;   Player/Stats  PlayerStats       health / energy / breath / hunger, respawn
+;   Player/Interaction  PlayerInteraction   aim, mine, place, interact
+;
+; Reach them through `Game.player.visual` / `.input` / `.stats` / `.interaction`.
+
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Script" path="res://player/player.gd" id="1_actor"]
+[ext_resource type="Script" path="res://player/player_visual.gd" id="2_visual"]
+[ext_resource type="Script" path="res://player/player_input.gd" id="3_input"]
+[ext_resource type="Script" path="res://player/player_stats.gd" id="4_stats"]
+[ext_resource type="Script" path="res://player/player_interaction.gd" id="5_interact"]
+
+[node name="Player" type="Node3D"]
+script = ExtResource("1_actor")
+box_size = Vector3(0.62, 1.75, 0.62)
+max_health = 100.0
+move_speed = 6.4
+jump_speed = 12.6
+faction = &"player"
+
+[node name="Visual" type="Node3D" parent="."]
+script = ExtResource("2_visual")
+
+[node name="Input" type="Node" parent="."]
+script = ExtResource("3_input")
+
+[node name="Stats" type="Node" parent="."]
+script = ExtResource("4_stats")
+death_drop_fraction = 0.3
+respawn_delay = 2.6
+
+[node name="Interaction" type="Node" parent="."]
+script = ExtResource("5_interact")

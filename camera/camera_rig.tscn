@@ -1,0 +1,32 @@
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Script" path="res://camera/camera_rig.gd" id="1_scr"]
+[ext_resource type="Script" path="res://camera/camera_effects.gd" id="2_fx"]
+[ext_resource type="Script" path="res://camera/depth_of_field.gd" id="3_dof"]
+[ext_resource type="Script" path="res://camera/flip_transition.gd" id="4_flip"]
+[ext_resource type="Script" path="res://camera/plane_indicator.gd" id="5_rose"]
+
+[node name="CameraRig" type="Node3D"]
+script = ExtResource("1_scr")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 44)
+projection = 1
+current = true
+size = 26.0
+near = 0.05
+far = 220.0
+
+[node name="Effects" type="Node" parent="."]
+script = ExtResource("2_fx")
+
+[node name="DepthOfField" type="Node" parent="."]
+script = ExtResource("3_dof")
+
+[node name="FlipTransition" type="CanvasLayer" parent="."]
+layer = -1
+script = ExtResource("4_flip")
+
+[node name="PlaneIndicator" type="CanvasLayer" parent="."]
+layer = 2
+script = ExtResource("5_rose")
