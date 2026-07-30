@@ -1,6 +1,0 @@
-[gd_scene load_steps=2 format=3]
-
-[ext_resource type="Script" path="res://entities/item_drop.gd" id="1_scr"]
-
-[node name="ItemDrop" type="Node3D" groups=["item_drops"]]
-script = ExtResource("1_scr")

@@ -1,0 +1,3 @@
+# Godot keeps its import cache here; everything in it is regenerated.
+.godot/
+export_presets.cfg
