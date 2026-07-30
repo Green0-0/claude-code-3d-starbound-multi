@@ -25,41 +25,37 @@ extends RefCounted
 ## Nothing here is procedurally generated and there are no farm animals: these
 ## are the named creatures, and the starting planet is stocked from them.
 
-# ------------------------------------------------------------------ families
-const FAM_GROUND := &"ground"
-const FAM_FLYING := &"flying"
-const FAM_AQUATIC := &"aquatic"
-const FAM_SPECIAL := &"special"
-const FAM_BOSS := &"boss"
+## Re-exported from `CreatureTraits` so `SpeciesDB.TEMPER_PASSIVE` still reads
+## naturally at call sites. The definitions live there rather than here because
+## the inner `Def` class below needs them, and an inner class that reaches back
+## out to its own outer `class_name` is a self-dependency the editor's analyser
+## refuses to resolve.
+const FAM_GROUND := CreatureTraits.FAM_GROUND
+const FAM_FLYING := CreatureTraits.FAM_FLYING
+const FAM_AQUATIC := CreatureTraits.FAM_AQUATIC
+const FAM_SPECIAL := CreatureTraits.FAM_SPECIAL
+const FAM_BOSS := CreatureTraits.FAM_BOSS
 
-# --------------------------------------------------------------- temperament
-## Never fights, even when hit. Runs instead.
-const TEMPER_PASSIVE := &"passive"
-## Flees on sight, and only fights when cornered with nowhere to run.
-const TEMPER_SKITTISH := &"skittish"
-## Ignores you until you come too close or draw blood.
-const TEMPER_DEFENSIVE := &"defensive"
-## Hunts on sight.
-const TEMPER_AGGRESSIVE := &"aggressive"
-## Holds absolutely still until you are almost touching it.
-const TEMPER_AMBUSH := &"ambush"
+const TEMPER_PASSIVE := CreatureTraits.TEMPER_PASSIVE
+const TEMPER_SKITTISH := CreatureTraits.TEMPER_SKITTISH
+const TEMPER_DEFENSIVE := CreatureTraits.TEMPER_DEFENSIVE
+const TEMPER_AGGRESSIVE := CreatureTraits.TEMPER_AGGRESSIVE
+const TEMPER_AMBUSH := CreatureTraits.TEMPER_AMBUSH
 
-# ------------------------------------------------------------------ activity
-const ACTIVE_DAY := &"diurnal"
-const ACTIVE_NIGHT := &"nocturnal"
-const ACTIVE_ALWAYS := &"always"
+const ACTIVE_DAY := CreatureTraits.ACTIVE_DAY
+const ACTIVE_NIGHT := CreatureTraits.ACTIVE_NIGHT
+const ACTIVE_ALWAYS := CreatureTraits.ACTIVE_ALWAYS
 
-# -------------------------------------------------------------------- social
-const SOCIAL_ALONE := &"solitary"
-const SOCIAL_HERD := &"herd"
-const SOCIAL_PACK := &"pack"
+const SOCIAL_ALONE := CreatureTraits.SOCIAL_ALONE
+const SOCIAL_HERD := CreatureTraits.SOCIAL_HERD
+const SOCIAL_PACK := CreatureTraits.SOCIAL_PACK
 
 
 class Def extends RefCounted:
 	var id: StringName = &""
 	var display := ""
 	var description := ""
-	var family: StringName = SpeciesDB.FAM_GROUND
+	var family: StringName = CreatureTraits.FAM_GROUND
 	var locomotion: StringName = &"walk"        ## walk, hop, fly, float, swim, root, climb
 	var threat := 0
 	var biomes: Array[StringName] = []
@@ -79,9 +75,9 @@ class Def extends RefCounted:
 	var armour_hp := 0.0
 
 	# --- character
-	var temperament: StringName = SpeciesDB.TEMPER_DEFENSIVE
-	var activity: StringName = SpeciesDB.ACTIVE_ALWAYS
-	var social: StringName = SpeciesDB.SOCIAL_ALONE
+	var temperament: StringName = CreatureTraits.TEMPER_DEFENSIVE
+	var activity: StringName = CreatureTraits.ACTIVE_ALWAYS
+	var social: StringName = CreatureTraits.SOCIAL_ALONE
 	var pack_min := 1
 	var pack_max := 1
 	## How far from where it woke up it will go before turning back. 0 = nomad.
@@ -140,7 +136,7 @@ class Def extends RefCounted:
 		size = s
 		return self
 
-	func acts(temper: StringName, when := SpeciesDB.ACTIVE_ALWAYS) -> Def:
+	func acts(temper: StringName, when := CreatureTraits.ACTIVE_ALWAYS) -> Def:
 		temperament = temper
 		activity = when
 		return self
@@ -220,19 +216,17 @@ class Def extends RefCounted:
 
 	# --- queries -------------------------------------------------------------
 
+	## Matching on a constant that lives in another script forces that script to
+	## be fully resolved at parse time. Delegating instead keeps the dependency
+	## to a plain function call, which nothing has to resolve early.
 	func is_awake(night: bool) -> bool:
-		match activity:
-			SpeciesDB.ACTIVE_DAY: return not night
-			SpeciesDB.ACTIVE_NIGHT: return night
-		return true
+		return CreatureTraits.awake_now(activity, night)
 
 	func hunts() -> bool:
-		return temperament == SpeciesDB.TEMPER_AGGRESSIVE \
-			or temperament == SpeciesDB.TEMPER_AMBUSH
+		return CreatureTraits.hunts(temperament)
 
 	func will_fight() -> bool:
-		return temperament != SpeciesDB.TEMPER_PASSIVE \
-			and temperament != SpeciesDB.TEMPER_SKITTISH
+		return CreatureTraits.will_fight(temperament)
 
 	func likes(item: StringName) -> bool:
 		return diet.has(item)

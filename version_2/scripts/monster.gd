@@ -148,7 +148,7 @@ func _ready() -> void:
 
 
 func is_boss() -> bool:
-	return species.family == SpeciesDB.FAM_BOSS
+	return species.family == CreatureTraits.FAM_BOSS
 
 
 func display_name() -> String:
@@ -218,19 +218,19 @@ func _perceive(delta: float) -> void:
 
 	# --- hearing. A sprinting player is audible through walls; a crouching one
 	# is nearly silent even in the open.
-	var heard := dist < minf(species.hearing, player.noise_radius())
+	var heard: bool = dist < minf(species.hearing, player.noise_radius())
 
 	# --- sight. Narrow cone, blocked by terrain, and halved at night for
 	# anything that hunts by day.
 	var seen := false
-	var range_v := species.sight
-	if game != null and game.sky.is_night() and species.activity == SpeciesDB.ACTIVE_DAY:
+	var range_v: float = species.sight
+	if game != null and game.sky.is_night() and species.activity == CreatureTraits.ACTIVE_DAY:
 		range_v *= 0.5
 	if dist < range_v:
 		var facing := Vector3(velocity.x, 0, velocity.z)
 		if facing.length_squared() < 0.04:
 			facing = _wander if _wander != Vector3.ZERO else Vector3(0, 0, 1)
-		var cone := species.sight_cone
+		var cone: float = species.sight_cone
 		# a lure or an all-round eye has no blind side at all
 		if cone <= -0.5 or to.normalized().dot(facing.normalized()) > cone:
 			seen = _line_of_sight(to, dist)
@@ -295,7 +295,7 @@ func _choose_state() -> void:
 		return
 
 	var night: bool = game != null and game.sky.is_night()
-	var awake := species.is_awake(night)
+	var awake: bool = species.is_awake(night)
 
 	# --- asleep, unless something is right on top of it
 	if not awake and alert < 0.75:
@@ -308,44 +308,45 @@ func _choose_state() -> void:
 		return
 
 	var engaged := alert >= 0.99 and _target_in_reach()
-	match species.temperament:
-		SpeciesDB.TEMPER_PASSIVE:
-			# never initiates; only runs, and only if it has been hurt
-			_set_state(State.GRAZE if _wants_to_eat() else State.WANDER)
-		SpeciesDB.TEMPER_SKITTISH:
-			if alert > 0.45:
-				_set_state(State.FLEE)
-			elif _wants_to_eat():
-				_set_state(State.GRAZE)
-			else:
-				_set_state(State.WANDER)
-		SpeciesDB.TEMPER_DEFENSIVE:
-			# only commits once you are inside its patch
-			if engaged and _inside_territory():
-				_set_state(State.ATTACK if _in_melee() else State.CHASE)
-			elif alert > 0.55 and _inside_territory():
-				_set_state(State.STALK)
-			elif alert > 0.25 and has_last_known:
-				_set_state(State.ALERT)
-			elif _wants_to_eat():
-				_set_state(State.GRAZE)
-			else:
-				_set_state(State.WANDER)
-		SpeciesDB.TEMPER_AMBUSH:
-			# perfectly still until you are almost touching it
-			if alert > 0.9 or _in_melee():
-				_set_state(State.ATTACK if _in_melee() else State.CHASE)
-			else:
-				_set_state(State.SLEEP)
-		_:
-			if alert >= 0.85:
-				_set_state(State.ATTACK if _in_melee() else State.CHASE)
-			elif alert > 0.35 and has_last_known:
-				_set_state(State.ALERT)
-			elif _wants_to_eat():
-				_set_state(State.GRAZE)
-			else:
-				_set_state(State.WANDER)
+	var temper := species.temperament
+
+	if temper == CreatureTraits.TEMPER_PASSIVE:
+		# never initiates; only runs, and only once it has been hurt
+		_set_state(State.GRAZE if _wants_to_eat() else State.WANDER)
+	elif temper == CreatureTraits.TEMPER_SKITTISH:
+		if alert > 0.45:
+			_set_state(State.FLEE)
+		elif _wants_to_eat():
+			_set_state(State.GRAZE)
+		else:
+			_set_state(State.WANDER)
+	elif temper == CreatureTraits.TEMPER_DEFENSIVE:
+		# only commits once you are inside its patch
+		if engaged and _inside_territory():
+			_set_state(State.ATTACK if _in_melee() else State.CHASE)
+		elif alert > 0.55 and _inside_territory():
+			_set_state(State.STALK)
+		elif alert > 0.25 and has_last_known:
+			_set_state(State.ALERT)
+		elif _wants_to_eat():
+			_set_state(State.GRAZE)
+		else:
+			_set_state(State.WANDER)
+	elif temper == CreatureTraits.TEMPER_AMBUSH:
+		# perfectly still until you are almost touching it
+		if alert > 0.9 or _in_melee():
+			_set_state(State.ATTACK if _in_melee() else State.CHASE)
+		else:
+			_set_state(State.SLEEP)
+	else:
+		if alert >= 0.85:
+			_set_state(State.ATTACK if _in_melee() else State.CHASE)
+		elif alert > 0.35 and has_last_known:
+			_set_state(State.ALERT)
+		elif _wants_to_eat():
+			_set_state(State.GRAZE)
+		else:
+			_set_state(State.WANDER)
 
 
 func _wants_to_eat() -> bool:
@@ -487,7 +488,7 @@ func _do_chase(delta: float) -> void:
 
 	# --- pack hunters flank rather than queue up behind each other
 	var aim := player.global_position
-	if species.social == SpeciesDB.SOCIAL_PACK:
+	if species.social == CreatureTraits.SOCIAL_PACK:
 		var side := Vector3(1, 0, 0) if int(get_instance_id()) % 2 == 0 \
 			else Vector3(-1, 0, 0)
 		aim += side * 1.8
@@ -512,7 +513,7 @@ func _do_flee(delta: float) -> void:
 	if away.length() < 0.1:
 		away = Vector3(1, 0, 0)
 	# herds run as one animal: steer toward the herd's average heading
-	if species.social == SpeciesDB.SOCIAL_HERD:
+	if species.social == CreatureTraits.SOCIAL_HERD:
 		away = away.normalized().lerp(_herd_heading(away.normalized()), 0.45)
 	_drive(away.normalized() * species.speed * 1.35, delta, 30.0)
 	if on_floor and _hop <= 0.0 and _blocked_ahead():
@@ -584,7 +585,7 @@ func _wander_about(delta: float, speed_mult := 0.7) -> void:
 			_wander = Vector3(cos(a), 0, sin(a))
 		# stay inside the patch, or near the herd
 		var anchor := home
-		if species.social == SpeciesDB.SOCIAL_HERD:
+		if species.social == CreatureTraits.SOCIAL_HERD:
 			anchor = _herd_centre()
 		var pull := anchor - global_position
 		pull.y = 0.0
@@ -843,7 +844,7 @@ func hurt(amount: float, element: StringName = Blocks.ELEM_PHYSICAL,
 		knock := Vector3.ZERO, source: Node = null) -> float:
 	if _dying:
 		return 0.0
-	var mult := float(species.resists.get(element, 1.0))
+	var mult: float = float(species.resists.get(element, 1.0))
 	var dealt := amount * mult
 
 	if shell > 0.0:
@@ -867,9 +868,9 @@ func hurt(amount: float, element: StringName = Blocks.ELEM_PHYSICAL,
 	bond = maxf(bond - 0.5, 0.0)
 
 	# a pack closes in; a herd scatters
-	if species.social == SpeciesDB.SOCIAL_PACK:
+	if species.social == CreatureTraits.SOCIAL_PACK:
 		alarm(global_position, 18.0, false)
-	elif species.social == SpeciesDB.SOCIAL_HERD:
+	elif species.social == CreatureTraits.SOCIAL_HERD:
 		alarm(global_position, 14.0, true)
 	var alarm_radius := float(species.flags.get(&"alarm", 0.0))
 	if alarm_radius > 0.0:
@@ -892,7 +893,7 @@ func _die(source: Node) -> void:
 			game.spawn_impact(global_position + Vector3(0, _half.y, 0),
 				species.alt)
 	# the ones that call for help do it loudest at the end
-	if species.social == SpeciesDB.SOCIAL_PACK:
+	if species.social == CreatureTraits.SOCIAL_PACK:
 		alarm(global_position, 20.0, false)
 	var summon: StringName = species.flags.get(&"summons", &"")
 	if summon != &"" and game != null:
