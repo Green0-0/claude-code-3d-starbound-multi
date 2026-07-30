@@ -31,6 +31,8 @@ const MAX_UPLOADS_PER_FRAME := 4
 const RESORT_INTERVAL := 0.2
 ## Chunks whose centre is further outside the slab than this are deprioritised.
 const SLAB_MARGIN := 16.0
+## Radius of the front-layer peek window, as a fraction of viewport height.
+const CUT_RADIUS := 0.21
 
 var _chunks: Dictionary = {}            ## Vector3i -> Dictionary of nodes
 ## True when a real lighting module is present (it flips `Chunk.lit`). With the
@@ -159,7 +161,36 @@ func _push_shader_params() -> void:
 	var fog := Color(0.09, 0.11, 0.16)
 	if Lighting.has_method(&"sky_color"):
 		fog = Lighting.sky_color().darkened(0.55)
-	Atlas.set_view_params(View.shader_params(), fog)
+	var params := View.shader_params()
+	params.merge(_cutaway_params(), true)
+	Atlas.set_view_params(params, fog)
+
+
+## Where on screen the "peek" window through front-layer voxels is centred.
+##
+## Voxels between the player and the camera are drawn solid — the world must
+## always read as matter — but a soft circle around the player dissolves so you
+## can see yourself and your immediate surroundings. Reported in SCREEN_UV so
+## the shader needs no projection matrices.
+func _cutaway_params() -> Dictionary:
+	var vp := get_viewport()
+	var cam := vp.get_camera_3d() if vp != null else null
+	var size := vp.get_visible_rect().size if vp != null else Vector2(1280, 720)
+	var aspect: float = size.x / maxf(1.0, size.y)
+	if cam == null or Game.player == null:
+		return {"cut_center": Vector2(0.5, 0.5), "cut_radius": 0.0, "cut_aspect": aspect}
+	var focus: Vector3 = Game.player.global_position
+	if Game.player is VoxelEntity:
+		focus = (Game.player as VoxelEntity).aabb_center()
+	# Behind the camera would unproject to nonsense; fall back to screen centre.
+	if cam.is_position_behind(focus):
+		return {"cut_center": Vector2(0.5, 0.5), "cut_radius": CUT_RADIUS, "cut_aspect": aspect}
+	var scr := cam.unproject_position(focus)
+	return {
+		"cut_center": Vector2(scr.x / maxf(1.0, size.x), scr.y / maxf(1.0, size.y)),
+		"cut_radius": CUT_RADIUS,
+		"cut_aspect": aspect,
+	}
 
 
 func _collect_results() -> void:

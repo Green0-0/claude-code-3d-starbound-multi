@@ -192,6 +192,42 @@ func _beat_shift() -> void:
 			"destination occupied")
 	await shot("layer_shifted")
 
+	# --- the remapped bindings, exercised as real input ---
+	# `main.gd` reacts to InputEvents, so synthesise them rather than only
+	# poking the action state (which `Input.action_press` alone would do).
+	print("-- bindings: W/S depth, PageDown crouch --")
+	for action: StringName in [&"depth_in", &"depth_out", &"crouch"]:
+		ok("action exists: " + String(action), InputMap.has_action(action))
+	var before_layer := View.layer
+	var ev := InputEventAction.new()
+	ev.action = &"depth_in"
+	ev.pressed = true
+	Input.parse_input_event(ev)
+	await _frames(int(View.shift_duration * 60.0) + 30)
+	var moved_in: bool = View.layer != before_layer
+	if not moved_in:
+		# A refusal is legitimate if that layer is solid; try the other direction.
+		var ev2 := InputEventAction.new()
+		ev2.action = &"depth_out"
+		ev2.pressed = true
+		Input.parse_input_event(ev2)
+		await _frames(int(View.shift_duration * 60.0) + 30)
+		moved_in = View.layer != before_layer
+	ok("W / S traverse the depth axis", moved_in,
+		"layer %d -> %d" % [before_layer, View.layer])
+
+	Input.action_press(&"crouch")
+	await _frames(20)
+	var crouched: bool = p.has_method(&"is_crouching") and bool(p.call(&"is_crouching"))
+	Input.action_release(&"crouch")
+	await _frames(10)
+	# Crouch needs the player grounded; report rather than fail if airborne.
+	if crouched:
+		ok("PageDown crouches", true)
+	else:
+		ok("PageDown crouches", not p.on_floor,
+			"not grounded, crouch not applicable" if not p.on_floor else "grounded but did not crouch")
+
 
 func _beat_ui() -> void:
 	print("-- interface --")

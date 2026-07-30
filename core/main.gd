@@ -66,8 +66,21 @@ func _unhandled_input(event: InputEvent) -> void:
 		if not UI.captures_input():
 			View.request_flip(1)
 	elif event.is_action_pressed(&"depth_in"):
-		if not UI.captures_input():
+		if _depth_input_allowed():
 			View.request_shift(1)
 	elif event.is_action_pressed(&"depth_out"):
-		if not UI.captures_input():
+		if _depth_input_allowed():
 			View.request_shift(-1)
+
+## W / S both traverse the depth axis and drive `move_up` / `move_down`, which
+## is what climbs a ladder or swims. Ladders and water win: pressing W on a
+## ladder should climb it, not shove the player into the next layer.
+func _depth_input_allowed() -> bool:
+	if UI.captures_input():
+		return false
+	var p: Node = Game.player
+	if p != null:
+		for probe: StringName in [&"is_climbing", &"is_swimming"]:
+			if p.has_method(probe) and bool(p.call(probe)):
+				return false
+	return true

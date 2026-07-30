@@ -92,7 +92,9 @@ func poll(delta: float) -> void:
 	if jump_pressed:
 		_jump_buffer = JUMP_BUFFER
 
-	crouch_held = Input.is_action_pressed(&"move_down")
+	# Crouch has its own binding (PageDown). It used to piggyback on
+	# `move_down`, but W/S now traverse the depth axis.
+	crouch_held = Input.is_action_pressed(&"crouch")
 
 	primary_held = Input.is_action_pressed(&"primary")
 	primary_pressed = Input.is_action_just_pressed(&"primary")

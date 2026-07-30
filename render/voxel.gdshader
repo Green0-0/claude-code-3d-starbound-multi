@@ -54,12 +54,34 @@ uniform float edge_width : hint_range(0.0, 0.25) = 0.06;
 // camera — which matters a great deal when deciding whether to shift a layer.
 // So the interior is discarded and only a thin edge remains: a ghost wireframe
 // that reads the material without occluding anything.
-uniform float front_ghost : hint_range(0.0, 1.0) = 0.18;
+// Master switch for the front-layer treatment; 0 reverts to hard culling.
+uniform float front_ghost : hint_range(0.0, 1.0) = 1.0;
+// Width of the solid outline kept around every front-layer voxel face.
 uniform float front_ghost_width : hint_range(0.0, 0.25) = 0.045;
-// Only the nearest couple of front layers ghost. Standing on any slope puts
-// several layers between you and the camera, and outlining them all fills the
-// screen with a wire mesh that hides the very thing it is meant to clarify.
-uniform float front_ghost_layers : hint_range(0.0, 8.0) = 1.0;
+// How many layers in front of the play layer are drawn at all.
+// Every front layer the renderer streams is drawn, not just the nearest few:
+// culling deeper ones leaves the same hole-to-the-sky this was meant to fix.
+// The mesher already culls faces between solid neighbours, so in a solid mass
+// this is one surface, not a stack of them.
+uniform float front_ghost_layers : hint_range(0.0, 64.0) = 40.0;
+// Front-layer voxels are drawn SOLID by default: a hole punched through to the
+// sky reads as a blank white void, which is worse than not seeing past them.
+// Legibility comes from a peek window instead — a soft circle centred on the
+// player, inside which those voxels thin out to a screen-door dither so the
+// player, and any cave they are standing in, show through.
+uniform vec2 cut_center = vec2(0.5, 0.5);
+uniform float cut_radius : hint_range(0.0, 1.0) = 0.21;
+uniform float cut_aspect = 1.777;
+// Dither density at the very centre of the window. Deliberately NOT near zero:
+// at 0 the blocking voxel disappears completely, and wherever nothing lies
+// behind it that leaves a hole straight through to the sky — the blank void this
+// whole scheme exists to avoid. A quarter of the pixels is enough to keep the
+// material present while leaving the player plainly readable through the gaps.
+uniform float front_fill_center : hint_range(0.0, 1.0) = 0.16;
+// ...and at its edge, blending out to fully solid beyond.
+uniform float front_fill_edge : hint_range(0.0, 1.0) = 0.55;
+// How much of the real material colour survives in a front-layer pixel.
+uniform float front_material : hint_range(0.0, 1.0) = 0.78;
 
 varying vec3 v_world;
 varying vec3 v_normal_w;
@@ -81,6 +103,17 @@ float voxel_layer(vec3 world_pos, vec3 nrm) {
 	return floor(depth_axis < 1.0 ? centre.x : centre.z);
 }
 
+// 4x4 ordered dither, the compact recursive form. Screen-space so the stipple
+// stays put as the world scrolls, which reads as translucency rather than noise.
+float ps_bayer2(vec2 a) {
+	a = floor(a);
+	return fract(a.x * 0.5 + a.y * a.y * 0.75);
+}
+
+float ps_bayer4(vec2 a) {
+	return ps_bayer2(0.5 * a) * 0.25 + ps_bayer2(a);
+}
+
 void fragment() {
 	float layer_off = (voxel_layer(v_world, v_normal_w) - play_layer) * depth_sign;
 
@@ -89,15 +122,26 @@ void fragment() {
 	vec2 cell = fract(UV);
 	float edge = min(min(cell.x, 1.0 - cell.x), min(cell.y, 1.0 - cell.y));
 
-	// Layers in front of the play layer may not fill — only outline. Their
-	// interiors are discarded so nothing ever occludes the player, but a thin
-	// ghost edge remains so you can still tell solid matter is between you and
-	// the camera before deciding to shift a layer.
+	// Layers in front of the play layer must not hide the player, but they must
+	// not vanish either: culling them outright punches a hole straight through
+	// to the sky, which reads as a blank white void wherever there is nothing
+	// behind to draw. Instead the blocking voxel is drawn for real through a
+	// screen-space dither — solid enough to be recognisable matter, sparse
+	// enough that a cave (or the player) behind it shows through the gaps.
 	bool in_front = layer_off < -slab_front - 0.5;
 	float depth_in_front = -layer_off - slab_front;
+	// Distance from the peek window's centre, in units of its radius.
+	vec2 cd = SCREEN_UV - cut_center;
+	cd.x *= cut_aspect;
+	float cut_r = length(cd) / max(cut_radius, 0.0001);
+	// 1 at the centre of the window, 0 outside it.
+	float openness = 1.0 - smoothstep(0.55, 1.0, cut_r);
+	float fill = mix(front_fill_edge, front_fill_center, openness);
+	fill = mix(1.0, fill, step(0.001, openness) * min(openness * 3.0, 1.0));
+	bool keep = ps_bayer4(FRAGCOORD.xy) < fill;
 	if (in_front && (front_ghost <= 0.001
 			|| depth_in_front > front_ghost_layers + 0.5
-			|| edge > front_ghost_width)) {
+			|| !keep)) {
 		discard;
 	}
 
@@ -128,8 +172,16 @@ void fragment() {
 	}
 
 	// `fragment()` may not `return`, so both cases are selected, not branched out.
-	float ghost = front_ghost / (1.0 + 1.4 * max(depth_in_front - 1.0, 0.0));
-	vec3 ghost_col = mix(fog_color, tex.rgb, 0.65) * ghost;
+	// A front-layer pixel keeps most of its material colour but is hazed toward
+	// the fog and dimmed with depth, so it reads as "in front of you, not yours".
+	// Front voxels are real terrain, but they must never be mistaken for the
+	// layer you can stand on: dim and desaturate them, and dim harder inside the
+	// peek window so the opening reads as an opening.
+	float ghost_dim = mix(0.70, 0.42, openness);
+	vec3 ghost_base = tex.rgb * max(shade, 0.5);
+	float ghost_grey = dot(ghost_base, vec3(0.299, 0.587, 0.114));
+	ghost_base = mix(ghost_base, vec3(ghost_grey), 0.35);
+	vec3 ghost_col = mix(fog_color, ghost_base, front_material) * ghost_dim;
 	vec3 emit = texture(emission_tex, vec3(UV, v_layer)).rgb
 		* v_emit * emission_energy * (1.0 - fade * 0.85);
 

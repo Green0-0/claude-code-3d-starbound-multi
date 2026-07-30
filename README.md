@@ -18,8 +18,9 @@ You do not move — the world re-reveals itself along a new axis. A wall becomes
 a corridor. A sealed vault turns out to have had a door all along, facing a
 direction you had not looked from.
 
-**Shift** (`PgUp` / `PgDn`) steps you one voxel layer into or out of the screen.
-This is real traversal, and it can be blocked.
+**Shift** (`W` / `S`) steps you one voxel layer into or out of the screen. This
+is real traversal, and it can be blocked. On a ladder or in water, `W`/`S` climb
+or swim instead — those win over the layer shift.
 
 Starbound's foreground/background tile duality becomes literal here: the
 "background" is simply the layers behind you, rendered dimmer by the slab
@@ -40,9 +41,9 @@ generated procedurally at runtime.
 | | |
 |---|---|
 | `A` / `D` | move (screen-left / screen-right, in the current plane) |
-| `Space` | jump · `Shift` sprint |
+| `Space` | jump · `Shift` sprint · `PgDn` crouch |
 | `Q` / `E` | flip the view plane 90° |
-| `PgUp` / `PgDn` | shift one layer deeper / shallower |
+| `W` / `S` | shift one layer deeper / shallower (climb or swim when on a ladder or in water) |
 | Left / Right mouse | mine / place |
 | `F` | interact · `G` activate tech |
 | `I` `C` `J` `M` | inventory, crafting, quest log, star map |

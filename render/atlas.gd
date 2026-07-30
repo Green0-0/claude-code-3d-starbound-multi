@@ -259,6 +259,9 @@ func set_view_params(params: Dictionary, fog: Color = Color(0.09, 0.11, 0.16)) -
 		m.set_shader_parameter("slab_front", params.get("slab_front", float(Const.SLAB_FRONT)))
 		m.set_shader_parameter("flip_blend", params.get("flip_blend", 0.0))
 		m.set_shader_parameter("fog_color", fog)
+		m.set_shader_parameter("cut_center", params.get("cut_center", Vector2(0.5, 0.5)))
+		m.set_shader_parameter("cut_radius", params.get("cut_radius", 0.20))
+		m.set_shader_parameter("cut_aspect", params.get("cut_aspect", 1.777))
 
 
 ## Immutable per-block tables handed to the mesher so meshing threads never
