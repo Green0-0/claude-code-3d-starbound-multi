@@ -99,6 +99,8 @@ func _run() -> void:
 
 	var main: Node = load("res://main.tscn").instantiate()
 	get_tree().root.add_child(main)
+	# Pin the run so screenshots are comparable between iterations.
+	Game.run_seed = 20240729
 	await _frames(180)
 
 	await _beat_title()
@@ -209,21 +211,32 @@ func _beat_ui() -> void:
 
 func _beat_planet() -> void:
 	print("-- travel to a planet --")
+	# Prefer a temperate, vegetated world: it exercises foliage, water and stone
+	# together, and is the fairest readability test. Fall back to anything landable.
 	var target := ""
+	var fallback := ""
+	const PREFERRED := ["forest", "garden", "jungle", "savannah", "plains"]
 	for sid: String in Universe.system_ids():
 		for bid: String in Universe.system_body_ids(sid):
 			var m: Dictionary = Universe.planet_meta(bid)
-			if String(m.get("generator", "planet")) == "planet":
+			if String(m.get("generator", "planet")) != "planet":
+				continue
+			if fallback == "":
+				fallback = bid
+			if PREFERRED.has(String(m.get("type", ""))):
 				target = bid
 				break
 		if target != "":
 			break
+	if target == "":
+		target = fallback
+	note("planet type: %s" % String(Universe.planet_meta(target).get("type", "?")))
 	ok("found a landable world", target != "", target)
 	if target == "":
 		return
 	Game.travel_to_planet(target)
 	# Terrain is expensive; give streaming real time to fill the slab.
-	await _frames(420)
+	await _frames(600)
 	ok("planet loaded", World.planet_id == target, World.planet_id)
 	var solid := 0
 	for cp: Vector3i in World.chunks:
@@ -233,6 +246,33 @@ func _beat_planet() -> void:
 	if p != null:
 		ok("player on the surface", p.global_position.y > 1.0,
 			"y=%.1f" % p.global_position.y)
+	# Diagnostic: what, if anything, is chipping away at the player here?
+	var seen: Dictionary = {}
+	Events.player_damaged.connect(func(amount: float, element: String, source: Node) -> void:
+		var key := "%s from %s" % [element, source.name if source != null else "<environment>"]
+		seen[key] = int(seen.get(key, 0)) + 1
+		if int(seen[key]) == 1:
+			note("DAMAGE: %.1f %s" % [amount, key]))
+	await _frames(180)
+	for k: String in seen:
+		note("damage tally: %s x%d" % [k, int(seen[k])])
+	# --- diagnostic: what is actually around the player? ---
+	if p != null:
+		var f := Const.floor_v(p.global_position)
+		note("world %dx%d  player %v  layer %d  view %d" % [
+			World.size_x, World.size_z, f, View.layer, View.view])
+		var tally: Dictionary = {}
+		for dl in range(-6, 7):
+			for dy in range(-4, 5):
+				var q := f + View.right() * dl + Vector3i(0, dy, 0)
+				var bn := String(Blocks.get_type(World.get_block(q)).name)
+				tally[bn] = int(tally.get(bn, 0)) + 1
+		var parts: Array[String] = []
+		for k: String in tally:
+			parts.append("%s:%d" % [k, int(tally[k])])
+		parts.sort()
+		note("play-layer blocks -> " + ", ".join(parts))
+		note("chunk holders rendered: %d" % int(Game.world_renderer.stats.get("meshed", -1)))
 	await shot("planet_surface")
 	await hold(&"move_right", 1.2)
 	await _frames(30)
@@ -248,8 +288,8 @@ func _beat_mine_and_place() -> void:
 	var feet := Const.floor_v(p.global_position)
 	var target := Vector3i.ZERO
 	var found := false
-	for dl in range(1, 5):
-		for dy in [0, -1, 1]:
+	for dl in range(1, 7):
+		for dy in [-1, 0, -2, 1, 2]:
 			var q := feet + View.right() * dl + Vector3i(0, dy, 0)
 			if World.is_solid(q):
 				target = q
@@ -273,20 +313,24 @@ func _beat_mine_and_place() -> void:
 	await shot("placed_block")
 
 	# A small structure, to prove building works over several voxels.
+	# Build on genuine ledges: air with something solid underneath. Scanning for
+	# that is what makes this deterministic across seeds, rather than guessing a
+	# fixed offset that may be buried in a hillside.
 	var built := 0
-	for i in 4:
-		# Find genuine air above the local surface for each column.
+	var attempted := 0
+	for i in 8:
+		if attempted >= 4:
+			break
 		var col := feet + View.right() * (2 + i)
-		var q := col
-		for up in range(1, 8):
-			var probe := col + Vector3i(0, up, 0)
-			if World.is_air(probe):
-				q = probe
+		for up in range(-2, 6):
+			var q := col + Vector3i(0, up, 0)
+			if World.is_air(q) and World.is_solid(q - Vector3i(0, 1, 0)):
+				attempted += 1
+				if World.place_block(q, before):
+					built += 1
 				break
-		if World.is_air(q) and World.place_block(q, before):
-			built += 1
 	await _frames(30)
-	ok("built a small structure", built >= 2, "%d/4 blocks placed" % built)
+	ok("built a small structure", built >= 2, "%d of %d ledges built" % [built, attempted])
 	await shot("built_structure")
 
 

@@ -11,10 +11,13 @@ const LOAD_VERTICAL := 4   ## chunks above/below
 const LOAD_DEPTH := 2      ## chunks in front of / behind the play layer
 const UNLOAD_SLACK := 2    ## extra chunks kept before eviction
 ## Full terrain generation measured at ~68 ms mean / 200 ms worst per chunk
-## (tools/perf_probe.tscn), so generating even one chunk overruns a 60 fps
-## frame. Rather than pretend otherwise, generate at most one per frame and
-## then sit out enough frames to amortise the cost back toward the soft budget.
-const MAX_GEN_PER_FRAME := 1
+## (tools/perf_probe.tscn), so a chunk cannot fit in a 60 fps frame however the
+## budget is arranged. This is a straight trade: throttle harder and the player
+## outruns generation and walks into unloaded space, which is far worse than a
+## hitch. Two per frame with a short amortisation pause keeps the streaming
+## front ahead of a sprinting player while halving the worst-case stall of the
+## naive three. The real fix is threading `PlanetGen`; see README.
+const MAX_GEN_PER_FRAME := 2
 const GEN_TIME_BUDGET_USEC := 8000
 
 var planet_id: String = ""
@@ -310,7 +313,7 @@ func _pump_generation() -> void:
 	if spent > GEN_TIME_BUDGET_USEC:
 		# Spread one heavy chunk over the next few frames instead of stacking
 		# another on top of it. Capped so streaming still makes progress.
-		_gen_debt_frames = mini(4, spent / GEN_TIME_BUDGET_USEC)
+		_gen_debt_frames = mini(2, spent / GEN_TIME_BUDGET_USEC)
 
 
 ## Drain the whole queue synchronously. Only for spawn placement and teleports,
@@ -379,6 +382,21 @@ func _flush_dirty() -> void:
 
 
 # ==================================================================== queries
+## Highest *opaque* solid block in a column: real ground.
+##
+## `surface_y` stops at the first solid voxel from the sky down, which on a
+## forested world is the top of the tree canopy. Spawning or teleporting to that
+## drops the player inside the leaves, where the view is nothing but layers of
+## alpha-blended foliage. Leaves, glass and other see-through blocks are all
+## non-opaque, so requiring opacity is exactly the right filter.
+func ground_y(x: int, z: int, from_y: int = Const.WORLD_HEIGHT - 1) -> int:
+	for y in range(mini(from_y, Const.WORLD_HEIGHT - 1), -1, -1):
+		var id := get_block(Vector3i(x, y, z))
+		if id != Const.AIR and Blocks.is_solid(id) and Blocks.is_opaque(id):
+			return y
+	return -1
+
+
 ## First solid block scanning downward from `y`; returns -1 if none.
 func surface_y(x: int, z: int, from_y: int = Const.WORLD_HEIGHT - 1) -> int:
 	for y in range(mini(from_y, Const.WORLD_HEIGHT - 1), -1, -1):

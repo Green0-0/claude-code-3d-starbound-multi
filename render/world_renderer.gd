@@ -33,6 +33,14 @@ const RESORT_INTERVAL := 0.2
 const SLAB_MARGIN := 16.0
 
 var _chunks: Dictionary = {}            ## Vector3i -> Dictionary of nodes
+## True when a real lighting module is present (it flips `Chunk.lit`). With the
+## stub, nothing ever becomes lit, so gating on it would render an empty world.
+var _lighting_active := false
+## cpos -> msec when we first deferred it, so a chunk whose light never arrives
+## still gets drawn instead of staying invisible forever.
+var _lit_wait: Dictionary = {}
+const LIT_WAIT_MS := 6000
+
 var _queue: Array[Vector3i] = []
 var _queued: Dictionary = {}
 var _worker := MeshWorker.new()
@@ -48,6 +56,7 @@ var stats := {"meshed": 0, "queued": 0, "visible": 0, "tris": 0}
 
 
 func _ready() -> void:
+	_lighting_active = Lighting.has_method(&"is_lit")
 	Events.chunk_loaded.connect(_on_chunk_loaded)
 	Events.chunk_unloaded.connect(_on_chunk_unloaded)
 	Events.chunk_dirty.connect(_on_chunk_dirty)
@@ -164,6 +173,9 @@ func _pump(_delta: float) -> void:
 		return
 	var start := Time.get_ticks_usec()
 	var started := 0
+	# Chunks waiting on their light. Re-queued *after* the loop so this frame
+	# cannot pop them again and spin.
+	var deferred: Array[Vector3i] = []
 	while started < MAX_STARTS_PER_FRAME and not _queue.is_empty():
 		if Time.get_ticks_usec() - start > BUDGET_USEC:
 			break
@@ -172,6 +184,20 @@ func _pump(_delta: float) -> void:
 		var chunk: Chunk = World.get_chunk(cpos)
 		if chunk == null:
 			continue
+		# Do not bake a mesh before its light has been flooded. An unlit chunk
+		# falls back to full brightness, which renders underground stone as a
+		# near-white slab — the single worst readability artefact in the game.
+		# `Lighting` emits `chunk_dirty` when the flood lands, which re-queues us.
+		if not chunk.lit and _lighting_active:
+			var now := Time.get_ticks_msec()
+			var since: int = int(_lit_wait.get(cpos, now))
+			if not _lit_wait.has(cpos):
+				_lit_wait[cpos] = now
+			if now - since < LIT_WAIT_MS:
+				deferred.append(cpos)
+				continue
+			# Light never arrived; draw it rather than leave a hole.
+		_lit_wait.erase(cpos)
 		chunk.dirty = false
 		# All-air chunks never get geometry; dropping them here is what keeps
 		# the sky above a planet free.
@@ -191,6 +217,9 @@ func _pump(_delta: float) -> void:
 			continue
 		# Synchronous fallback: threading is off, or the queue is saturated.
 		_apply(ChunkMesher.build_arrays(snap))
+
+	for cpos: Vector3i in deferred:
+		_enqueue(cpos)
 
 
 func _apply(built: Dictionary) -> void:

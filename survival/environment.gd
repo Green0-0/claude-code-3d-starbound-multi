@@ -40,7 +40,12 @@ const BREATH_SECONDS := 42.0
 const DOSE_MAX := 100.0
 
 ## Comfort band: |body| below this and nothing bad happens.
-const COMFORT := 0.35
+## Half-width of the comfortable band, in the -1..+1 temperature scale.
+##
+## Must be wide enough that an ordinary temperate planet at noon is comfortable:
+## `Universe` hands out ~0.2-0.3 for forest worlds and midday adds a further
+## +0.16, so a band of 0.35 declared heatstroke on a pleasant afternoon.
+const COMFORT := 0.55
 ## How much one adjacent torch-grade light source warms you.
 const HEAT_PER_SOURCE := 0.55
 const HEAT_SAMPLE_RADIUS := 5
@@ -174,11 +179,19 @@ func _tick_temperature(player: VoxelEntity, delta: float) -> void:
 	else:
 		target *= 0.55                       # caves buffer the outside world
 
-	target -= local_heat
+	# Heat sources fight the *cold*; they never cook you on their own. Adding
+	# `local_heat` unconditionally would mean standing by a campfire in a
+	# temperate wood gives you heatstroke, and subtracting it (as this did)
+	# inverted the whole model: nearby ice reads as negative local heat, so
+	# `target -= local_heat` pushed you toward *overheating* in a snowfield.
+	target += minf(0.0, local_heat)          # ice and snow always chill
+	var warmth := maxf(0.0, local_heat)
 	# Campfires and heaters (`objects/`) apply `warm` directly rather than
 	# relying on the voxel sample, so honour it here too.
 	if Status.has(&"warm", player):
-		target -= 0.6
+		warmth += 0.6
+	if warmth > 0.0 and target < 0.0:
+		target = minf(0.0, target + warmth)
 	if player.submersion > 0.5:
 		target -= 0.18
 

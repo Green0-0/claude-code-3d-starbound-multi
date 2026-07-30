@@ -46,6 +46,15 @@ func _run() -> void:
 	check("items registered", Items.count() > 100, "%d" % Items.count())
 	check("air is id 0", Blocks.id(&"air") == Const.AIR)
 	check("stone resolves", Blocks.has(&"stone") and Blocks.id(&"stone") != Const.AIR)
+	# A shader that fails to compile makes `Atlas` hand back an untextured
+	# StandardMaterial3D fallback, and the whole world silently renders white.
+	# Assert we got the real slab shader on every voxel pass.
+	for pass_name: Array in [["opaque", Atlas.get_material(false)],
+			["transparent", Atlas.get_material(true)],
+			["liquid", Atlas.get_liquid_material()]]:
+		check("voxel material compiled: " + String(pass_name[0]),
+			pass_name[1] is ShaderMaterial,
+			"got %s" % ("ShaderMaterial" if pass_name[1] is ShaderMaterial else str(pass_name[1])))
 
 	# --------------------------------------------------------------- world
 	print("-- world --")

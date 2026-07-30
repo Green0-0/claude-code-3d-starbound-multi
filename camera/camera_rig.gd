@@ -31,6 +31,15 @@ extends Node3D
 @export var orbit_radius := 44.0
 ## Focus this far above the middle of the player's box.
 @export var eye_lift := 0.25
+## Downward tilt of the camera, in degrees.
+##
+## A perfectly horizontal side view shows nothing but flat front faces, so the
+## world reads as coloured silhouettes with no way to tell a near block from a
+## far one. Tilting a little — the Don't Starve trick — exposes the +Y face of
+## every voxel, which is what makes the grid legible as a solid 3D world while
+## still playing as a 2D platformer. Keep it small: past ~25 degrees the
+## vertical platforming read starts to suffer.
+@export_range(0.0, 40.0, 0.5) var camera_pitch := 17.0
 @export var near_plane := 0.05
 @export var far_plane := 220.0
 
@@ -461,9 +470,15 @@ func _write_transform(origin: Vector3, size: float) -> void:
 		off = effects.offset() * (size * 0.5)
 		roll = effects.roll()
 		extra_z = effects.depth_offset()
-	camera.transform = Transform3D(
-		Basis(Vector3(0.0, 0.0, 1.0), roll),
-		Vector3(off.x, off.y, orbit_radius + _flip_dolly_now + extra_z))
+	# Pitch the camera down about its own X, then push it back along its new
+	# view axis so the rig origin still lands dead centre of frame. Roll is
+	# applied after, about the view axis, so shake never tilts the horizon oddly.
+	var pitch := deg_to_rad(camera_pitch)
+	var b := Basis(Vector3.RIGHT, -pitch)
+	if not is_zero_approx(roll):
+		b = b * Basis(Vector3.BACK, roll)
+	var dist := orbit_radius + _flip_dolly_now + extra_z
+	camera.transform = Transform3D(b, b.z * dist + b.x * off.x + b.y * off.y)
 
 
 func _aspect() -> float:

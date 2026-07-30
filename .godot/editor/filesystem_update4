@@ -1,0 +1,6 @@
+res://render/world_renderer.gd
+res://sim/lighting/day_night.gd
+res://camera/camera_rig.gd
+res://core/game.gd
+res://core/voxel_world.gd
+res://survival/environment.gd

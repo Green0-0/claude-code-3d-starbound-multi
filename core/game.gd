@@ -32,6 +32,7 @@ var stats := {
 }
 
 const ITEM_DROP_SCENE := "res://entities/item_drop.tscn"
+const SPAWN_FINDER := "res://worldgen/spawn_finder.gd"
 var _drop_scene: PackedScene = null
 
 
@@ -197,10 +198,26 @@ func _place_player_on_surface() -> void:
 	for cy in range(Const.WORLD_HEIGHT_CHUNKS - 1, -1, -1):
 		World.request_chunk(Vector3i(x >> 4, cy, z >> 4))
 	World._pump_generation_all()
-	var y := World.surface_y(x, z)
-	if y < 0:
-		y = Const.WORLD_HEIGHT / 2
-	player.teleport(Vector3(x + 0.5, y + 1.2, z + 0.5))
+	# `worldgen/spawn_finder.gd` picks a spot that is flat in *both* horizontal
+	# axes, out of liquid, and clear in all four view planes. Prefer it; fall
+	# back to the centre column's ground level.
+	var spot := Vector3(x + 0.5, 0.0, z + 0.5)
+	var placed := false
+	if ResourceLoader.exists(SPAWN_FINDER):
+		var sf: Script = load(SPAWN_FINDER)
+		if sf != null and sf.has_method(&"find_spawn"):
+			var found: Variant = sf.call(&"find_spawn", World.size_x, World.size_z)
+			if found is Vector3 and (found as Vector3).y > 0.0:
+				spot = found
+				placed = true
+	if not placed:
+		var y := World.ground_y(x, z)
+		if y < 0:
+			y = Const.WORLD_HEIGHT / 2
+		spot.y = float(y) + 1.2
+	player.teleport(spot)
+	x = floori(spot.x)
+	z = floori(spot.z)
 	View.set_layer(z if View.depth_axis() == 2 else x)
 	World.update_streaming(player.global_position)
 

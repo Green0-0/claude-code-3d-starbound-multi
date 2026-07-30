@@ -46,7 +46,7 @@ const VIEW_NAMES := ["North", "West", "South", "East"]
 
 ## How many layers behind the play layer stay visible (tinted), and how many
 ## layers in front of it are dissolved so they never occlude the player.
-const SLAB_BEHIND := 12
+const SLAB_BEHIND := 5
 const SLAB_FRONT := 0
 
 # ----------------------------------------------------------------- block faces

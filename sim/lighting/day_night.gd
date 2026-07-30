@@ -33,6 +33,19 @@ var camera_bias := 0.38
 var horizon_y := 96.0
 ## World units from the horizon to the top of the sky gradient.
 var sky_span := 110.0
+## View depth at which fog starts in clear weather. The camera stands ~44 blocks
+## back, so anything below that would fog the play slab itself.
+const FOG_BEGIN_CLEAR := 62.0
+## ...and in the worst storm, where haze closing in is the point.
+const FOG_BEGIN_STORM := 26.0
+## Brightness ceiling for the sky. Deliberately gentle: the `WorldEnvironment`
+## derives ambient light *from* the sky (`ambient_light_source = SKY`), so
+## clamping this hard dims the entire world. Silhouetting pale terrain against a
+## pale sky is the voxel shader's `edge_darken` job, not this one's.
+const SKY_MAX_VALUE_TOP := 0.88
+const SKY_MAX_VALUE_HORIZON := 0.95
+## Minimum saturation for the sky; a grey-white sky reads as fog, not as air.
+const SKY_MIN_SATURATION := 0.28
 ## Days per full lunar cycle.
 var moon_cycle_days := 8
 
@@ -191,6 +204,17 @@ func _resolve_nodes() -> void:
 	_ensure_backdrop()
 
 
+## Clamp a sky colour's brightness and lift its saturation, preserving hue.
+static func _skyfloor(c: Color, max_value: float) -> Color:
+	var v: float = maxf(c.v, 0.0001)
+	var out := c
+	if v > max_value:
+		out = Color.from_hsv(c.h, c.s, max_value, c.a)
+	if out.s < SKY_MIN_SATURATION:
+		out = Color.from_hsv(out.h, SKY_MIN_SATURATION, out.v, out.a)
+	return out
+
+
 func _read_planet_meta() -> void:
 	var meta: Dictionary = World.planet
 	horizon_y = float(meta.get("sea_level", meta.get("surface_y", 96.0)))
@@ -282,6 +306,14 @@ func _update_sky(delta: float) -> void:
 		horizon_color = horizon_color.lerp(wx.tint, wx.tint_amount)
 		ambient_color = ambient_color.lerp(wx.tint, wx.tint_amount * 0.7)
 		fog_color = fog_color.lerp(wx.tint, wx.tint_amount)
+	# Playability floor on sky contrast. Terrain has to silhouette against the
+	# sky on *every* world, and the pale palettes (snow, desert, moon) drift so
+	# close to the value of the blocks in front of them that the player appears
+	# to stand on nothing. Cap how bright the sky may get and keep it saturated,
+	# so blocks always read as blocks. Deliberately applied after the weather
+	# tint, which would otherwise wash the cap straight back out.
+	top_color = _skyfloor(top_color, SKY_MAX_VALUE_TOP)
+	horizon_color = _skyfloor(horizon_color, SKY_MAX_VALUE_HORIZON)
 
 	# Stars: atmospheric planets wash them out by day; airless ones never do.
 	var atmospheric := clampf(1.0 - raw * 2.1, 0.0, 1.0)
@@ -354,9 +386,22 @@ func _apply_environment(pal: LitPlanet.Palette, wx: LitWeather, day: float, nigh
 		fog_d = fog_d * wx.fog_scale + wx.fog_add
 	env.ambient_light_color = ambient_color
 	env.ambient_light_energy = maxf(0.02, amb_energy)
+	# Depth-mode fog that only starts *beyond* the play slab.
+	#
+	# The camera is orthographic and sits a fixed ~44 blocks back, so every voxel
+	# the player can see is at almost exactly the same view depth. Exponential
+	# density fog therefore applies as a flat grey veil over the whole world and
+	# communicates nothing. Ramping from just past the slab outward keeps the
+	# playable layers crisp — the slab shader owns depth cueing — while distant
+	# scenery and weather still haze over. Heavy weather drags the near edge in.
 	env.fog_enabled = fog_d > 0.00005
+	env.fog_mode = Environment.FOG_MODE_DEPTH
 	env.fog_light_color = fog_color
-	env.fog_density = fog_d
+	env.fog_depth_begin = lerpf(FOG_BEGIN_CLEAR, FOG_BEGIN_STORM,
+		clampf(fog_d / 0.02, 0.0, 1.0))
+	env.fog_depth_end = env.fog_depth_begin + 90.0
+	env.fog_depth_curve = 1.0
+	env.fog_density = 1.0
 	env.fog_sky_affect = 0.0
 	env.background_energy_multiplier = lerpf(0.25, 1.0, clampf(day + 0.15, 0.0, 1.0))
 	if sky_material != null:
