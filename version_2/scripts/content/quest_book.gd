@@ -148,10 +148,10 @@ static func _side_guard() -> void:
 		.add(Quests.Kind.PLACE, &"lantern", 8, "Place lanterns") \
 		.rewards(200, [[&"iron_bar", 4]])
 
-	_side("side_the_big_one", "The Big One", &"guard",
-		"There is one out past the ridge that the patrols will not go near. "\
-		+ "I am not asking them to. I am asking you.") \
-		.add(Quests.Kind.KILL, &"boulder_beetle", 3, "Kill boulder beetles") \
+	_side("side_the_big_one", "Shell Game", &"guard",
+		"There are crustoise out past the ridge that the patrols will not go "\
+		+ "near. I am not asking them to. I am asking you.") \
+		.add(Quests.Kind.KILL, &"crustoise", 3, "Kill crustoise") \
 		.rewards(520, [[&"titanium_bar", 3]])
 
 

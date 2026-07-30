@@ -967,6 +967,12 @@ static func build_creature(shape: StringName, tint: Color, alt: Color,
 			&"chest": _mb_chest(img, ox, f, squash, tint, dark, lit, alt)
 			&"wraith": _mb_wraith(img, ox, f, squash, tint, dark, lit, alt)
 			&"titan": _mb_titan(img, ox, f, squash, tint, dark, lit, alt, features)
+			&"bulb": _mb_bulb(img, ox, f, squash, tint, dark, lit, alt, features)
+			&"crab": _mb_crab(img, ox, f, squash, tint, dark, lit, alt, features)
+			&"eye": _mb_eye(img, ox, f, squash, tint, dark, lit, alt)
+			&"orb": _mb_orb(img, ox, f, squash, tint, dark, lit, alt, features)
+			&"fish": _mb_fish(img, ox, f, squash, tint, dark, lit, alt, features)
+			&"robot": _mb_robot(img, ox, f, squash, tint, dark, lit, alt, features)
 			_: _mb_blob(img, ox, f, squash, tint, dark, lit, alt, features)
 		_mb_eyes(img, ox, shape, int(features.get("eyes", 2)), eye_col, f)
 	return ImageTexture.create_from_image(img)
@@ -1139,6 +1145,122 @@ static func _mb_titan(img: Image, ox: int, f: int, squash: float, tint: Color,
 		_rect(img, ox + 10, 15, 8, 3, lit)
 
 
+## Poptop and kin: a small body under an enormous flower bulb.
+static func _mb_bulb(img: Image, ox: int, f: int, squash: float, tint: Color,
+		dark: Color, lit: Color, alt: Color, features: Dictionary) -> void:
+	var bob: int = [0, -1, 0, 1][f]
+	# legs
+	for i in mini(int(features.get("limbs", 2)), 4):
+		var lx := 11 + (i % 2) * 6
+		var kick := int(sin(float(f) * 1.7 + float(i) * 2.0) * 2.0)
+		for j in 4:
+			_px(img, ox + lx + (kick if j > 2 else 0), 21 + j + bob, alt)
+	# body
+	_ellipse(img, ox, 14.0, 19.0 + float(bob), 5.4 * (1.0 + squash), 4.6, alt, dark)
+	# the bulb itself, petal by petal
+	var petals := int(features.get("petals", 5))
+	for p in petals:
+		var a := TAU * float(p) / float(petals) - PI * 0.5
+		var px := 14.0 + cos(a) * 5.2
+		var py := 10.0 + sin(a) * 4.2 + float(bob)
+		_ellipse(img, ox, px, py, 3.4, 3.0, tint, dark)
+	_ellipse(img, ox, 14.0, 11.0 + float(bob), 3.6, 3.2, lit, tint)
+
+
+## Crustoise, Ixodoom: a wide shell with legs poking out from under it.
+static func _mb_crab(img: Image, ox: int, f: int, squash: float, tint: Color,
+		dark: Color, lit: Color, alt: Color, features: Dictionary) -> void:
+	var limbs := mini(int(features.get("limbs", 6)), 8)
+	for i in limbs:
+		var side := 1 if i % 2 == 0 else -1
+		var tier := i / 2
+		var kick := int(sin(float(f) * 1.8 + float(i) * 1.3) * 2.0)
+		for j in 5:
+			_px(img, ox + 14 + side * (7 + j), 17 + tier * 2 + kick - j / 3, dark)
+	# claws
+	for side in [-1, 1]:
+		_ellipse(img, ox, 14.0 + float(side) * 11.0, 20.0, 2.6, 2.2, alt, dark)
+	# shell
+	_ellipse(img, ox, 14.0, 15.0, 9.5 * (1.0 + squash * 0.5), 6.6, tint, dark)
+	if bool(features.get("shell", false)):
+		for i in 4:
+			_rect(img, ox + 6 + i * 4, 11, 1, 8, dark)
+		_ellipse(img, ox, 14.0, 12.5, 6.0, 3.0, lit, tint)
+
+
+## Oculob: one eye, and it is looking at you from every angle.
+static func _mb_eye(img: Image, ox: int, f: int, squash: float, tint: Color,
+		dark: Color, lit: Color, alt: Color) -> void:
+	var r := 8.0 * (1.0 + squash * 0.6)
+	_ellipse(img, ox, 14.0, 15.0, r, r * 0.94, tint, dark)
+	var look: int = [0, 1, 0, -1][f]
+	_ellipse(img, ox, 14.0 + float(look), 15.0, 4.4, 4.4, Color(0.98, 0.98, 1.0),
+		Color(0.82, 0.84, 0.90))
+	_ellipse(img, ox, 14.0 + float(look) * 1.6, 15.0, 2.2, 2.2, alt, alt)
+	_ellipse(img, ox, 13.0 + float(look) * 1.6, 14.0, 0.8, 0.8, lit, lit)
+	# a few veins, so it reads as flesh rather than a marble
+	for i in 5:
+		var a := TAU * float(i) / 5.0
+		_px(img, ox + int(14.0 + cos(a) * 6.5), int(15.0 + sin(a) * 6.0), dark)
+
+
+## Skimbus: a drifting sac with trailing feelers.
+static func _mb_orb(img: Image, ox: int, f: int, squash: float, tint: Color,
+		dark: Color, lit: Color, alt: Color, features: Dictionary) -> void:
+	var drift := sin(float(f) * 1.6) * 1.5
+	_ellipse(img, ox, 14.0, 12.0 + drift, 7.6 * (1.0 + squash), 7.0, tint, dark)
+	_ellipse(img, ox, 11.5, 9.5 + drift, 2.6, 2.0, lit, lit)
+	var tendrils := int(features.get("tendrils", 4))
+	for i in tendrils:
+		var tx := 14 + int((float(i) - float(tendrils - 1) * 0.5) * 3.6)
+		for j in 7:
+			var sway := int(sin(float(f) * 1.4 + float(i) + float(j) * 0.5) * 1.6)
+			_px(img, ox + tx + sway, int(18.0 + drift) + j, alt if j % 2 == 0 else dark)
+
+
+## Anglure: mostly teeth, with a lantern out in front on a stalk.
+static func _mb_fish(img: Image, ox: int, f: int, squash: float, tint: Color,
+		dark: Color, lit: Color, alt: Color, features: Dictionary) -> void:
+	_ellipse(img, ox, 15.0, 16.0, 8.5 * (1.0 + squash), 6.4, tint, dark)
+	# tail
+	for j in 5:
+		_rect(img, ox + 23 + j / 2, 14 - j / 2 + int(sin(float(f)) * 1.5), 2, 4 + j, dark)
+	# jaw
+	var gape: int = [1, 3, 1, 0][f]
+	_rect(img, ox + 5, 18 + gape, 10, 2, dark)
+	var teeth := mini(int(features.get("teeth", 8)), 10)
+	for i in teeth:
+		_px(img, ox + 5 + i, 17 + gape, Color(0.96, 0.94, 0.88))
+		_px(img, ox + 5 + i, 20 + gape, Color(0.96, 0.94, 0.88))
+	if bool(features.get("lure", false)):
+		for j in 6:
+			_px(img, ox + 10 - j / 2, 12 - j, alt)
+		_ellipse(img, ox, 7.0, 5.0, 2.6, 2.6, lit, lit)
+
+
+## Scandroid: a chassis, one lens, and an antenna it will use.
+static func _mb_robot(img: Image, ox: int, f: int, squash: float, tint: Color,
+		dark: Color, lit: Color, alt: Color, features: Dictionary) -> void:
+	for i in 2:
+		var lx := 11 + i * 6
+		var swing := int(sin(float(f) * 1.7 + float(i) * 3.1) * 2.0)
+		_rect(img, ox + lx, 20, 2, 7 + swing / 2, dark)
+		_rect(img, ox + lx - 1, 26, 4, 2, alt)
+	_rect(img, ox + 7, 11, 14, 10, tint)
+	_rect(img, ox + 7, 11, 14, 2, lit)
+	_rect(img, ox + 7, 19, 14, 2, dark)
+	# a lens that sweeps
+	var sweep: int = [0, 2, 0, -2][f]
+	_ellipse(img, ox, 14.0 + float(sweep), 15.5, 3.4 * (1.0 + squash), 3.4, dark, dark)
+	_ellipse(img, ox, 14.0 + float(sweep), 15.5, 2.0, 2.0, alt, alt)
+	if bool(features.get("antenna", false)):
+		_rect(img, ox + 14, 5, 1, 6, dark)
+		_px(img, ox + 14, 4, alt)
+		if f % 2 == 0:
+			_px(img, ox + 13, 3, alt)
+			_px(img, ox + 15, 3, alt)
+
+
 static func _mb_eyes(img: Image, ox: int, shape: StringName, count: int,
 		col: Color, f: int) -> void:
 	if count <= 0:
@@ -1153,6 +1275,12 @@ static func _mb_eyes(img: Image, ox: int, shape: StringName, count: int,
 		&"chest": cy = 11
 		&"titan": cy = 7
 		&"wraith": cy = 8
+		&"bulb": cy = 18
+		&"crab": cy = 13
+		&"orb": cy = 11
+		&"fish": cy = 13
+		&"robot": return          # its lens is drawn as part of the chassis
+		&"eye": return            # it *is* the eye
 	var blink := f == 2 and count <= 2
 	for i in count:
 		var row := i / 4

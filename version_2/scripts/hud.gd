@@ -339,9 +339,14 @@ func _sync_effects() -> void:
 
 func _sync_info() -> void:
 	var b := player.feet_block()
+	var cut := world.cutaway
 	var cut_state := "cross-section" if world.has_cutaway_geometry() else "clear"
-	if not world.cutaway.enabled:
+	if not cut.enabled:
 		cut_state = "cutaway off"
+	else:
+		cut_state = "%s · %s" % [cut.mode_name().to_lower(), cut_state]
+		if cut.opacity > 0.0:
+			cut_state += " · ghost %d%%" % int(cut.opacity * 100.0)
 	var extra := ""
 	if game != null:
 		extra = "\n%s  day %d  %s   fuel %d" % [

@@ -62,3 +62,43 @@ cut_enabled={
 "type": "float",
 "value": 1.0
 }
+cut_mode={
+"type": "float",
+"value": 0.0
+}
+cut_keep_radius={
+"type": "float",
+"value": 2.75
+}
+cut_keep_bias={
+"type": "float",
+"value": 0.35
+}
+cut_opacity={
+"type": "float",
+"value": 0.0
+}
+cut_fade={
+"type": "float",
+"value": 16.0
+}
+cut_planar_depth={
+"type": "float",
+"value": 34.0
+}
+cut_planar_width={
+"type": "float",
+"value": 5.5
+}
+cut_planar_below={
+"type": "float",
+"value": 1.5
+}
+cut_planar_above={
+"type": "float",
+"value": 4.0
+}
+cut_occluded={
+"type": "float",
+"value": 0.0
+}

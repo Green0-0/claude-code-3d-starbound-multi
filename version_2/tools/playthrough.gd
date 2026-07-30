@@ -41,6 +41,32 @@ func _ready() -> void:
 	_run()
 
 
+## Clear a flat slab of stone to stand things on, well above the terrain, so a
+## showcase shot is not fighting the landscape.
+func _build_stage() -> Vector3:
+	var feet := player.feet_block()
+	var y := mini(feet.y + 6, VoxelWorld.WH - 6)
+	for dx in range(-14, 15):
+		for dz in range(-8, 9):
+			world.set_block(feet.x + dx, y - 1, feet.z + dz, Blocks.id(&"stone_brick"))
+			for up in range(0, 5):
+				world.set_block(feet.x + dx, y + up, feet.z + dz, Blocks.AIR)
+	return Vector3(feet.x + 0.5, float(y) + 0.05, feet.z + 0.5)
+
+
+## Put one of each in a row in front of the player, calm and standing still.
+func _line_up(roster: Array[StringName], at: Vector3, lateral: Vector3,
+		forward: Vector3) -> void:
+	for i in roster.size():
+		var offset := lateral * (float(i) - float(roster.size() - 1) * 0.5) * 2.6
+		var m: Monster = game.spawn_monster(roster[i],
+			at + offset + forward * 3.0 + Vector3(0, 0.4, 0), 1.0)
+		if m != null:
+			m.alert = 0.0
+			m.fear = 0.0
+			m.hunger = 0.0
+
+
 func _settle(frames: int) -> void:
 	for i in frames:
 		await get_tree().process_frame
@@ -156,7 +182,7 @@ func _run() -> void:
 		game.npc_offer_quest(npc)
 
 	# --- combat
-	var m: Monster = game.spawn_monster(&"thorn_creeper",
+	var m: Monster = game.spawn_monster(&"yokat",
 		player.global_position + Vector3(2.5, 0.6, 0.0), 1.0)
 	await _settle(20)
 	player.inventory.set_slot(0, Items.make(&"iron_sword", 1))
@@ -197,6 +223,55 @@ func _run() -> void:
 	game.liquids.on_block_changed(Vector3i(feet.x - 5, feet.y + 3, feet.z))
 	await _settle(60)
 	await _beat("water")
+
+	# --- a flat stage, so the poses and the creatures are actually legible
+	for n in game.npcs_root.get_children():
+		n.queue_free()
+	for n in game.monsters_root.get_children():
+		n.queue_free()
+	await _settle(4)
+	var stage := _build_stage()
+	player.teleport(stage)
+	await _settle(30)
+	await _beat("standing")
+
+	Input.action_press(&"crouch")
+	await _settle(30)
+	await _beat("crouched")
+	Input.action_release(&"crouch")
+	await _settle(20)
+
+	# --- the bestiary, lined up on the stage
+	var lateral := Vector3(game.rig.lateral())
+	var forward := Vector3(game.rig.axis())
+	var roster: Array[StringName] = [&"poptop", &"gleap", &"yokat", &"hypnare",
+		&"mandraflora", &"crustoise", &"voltip", &"scandroid"]
+	_line_up(roster, stage, lateral, forward)
+	await _settle(50)
+	await _beat("bestiary")
+
+	var roster2: Array[StringName] = [&"pteropod", &"narfin", &"fennix",
+		&"lumoth", &"oculob", &"batong", &"anglure", &"skimbus"]
+	for n in game.monsters_root.get_children():
+		n.queue_free()
+	await _settle(4)
+	_line_up(roster2, stage, lateral, forward)
+	await _settle(50)
+	await _beat("bestiary_2")
+
+	# --- the cut shapes
+	world.set_cutaway_mode(Cutaway.Mode.FILL)
+	await _settle(30)
+	await _beat("cut_fill")
+	world.set_cutaway_mode(Cutaway.Mode.PLANAR)
+	await _settle(30)
+	await _beat("cut_planar")
+	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+	world.set_cutaway_opacity(0.45)
+	await _settle(30)
+	await _beat("cut_ghost")
+	world.set_cutaway_opacity(0.0)
+	await _settle(10)
 
 	# --- techs
 	game.tech.equip(&"dash")

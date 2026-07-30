@@ -68,11 +68,20 @@ func _run() -> void:
 	print("== combat")
 	await _combat()
 
+	print("== crouch")
+	await _crouch()
+
+	print("== bestiary")
+	_bestiary()
+
 	print("== quests")
 	_quests()
 
 	print("== cutaway")
 	_cutaway()
+
+	print("== cutaway modes")
+	_cutaway_modes()
 
 	print("== space")
 	_space()
@@ -291,7 +300,7 @@ func _survival() -> void:
 func _combat() -> void:
 	var feet := player.feet_block()
 	var at := Vector3(feet.x + 4, feet.y + 1, feet.z)
-	var m: Monster = game.spawn_monster(&"pebble_grub", at, 1.0)
+	var m: Monster = game.spawn_monster(&"poptop", at, 1.0)
 	check("monster spawns", m != null)
 	if m == null:
 		return
@@ -302,8 +311,8 @@ func _combat() -> void:
 		"%.1f -> %.1f" % [hp, m.health])
 
 	# resistances actually resist
-	var lancer := SpeciesDB.get_def(&"ice_lancer")
-	check("resistances are read", float(lancer.resists.get(Blocks.ELEM_ICE, 1.0)) == 0.0)
+	var narfin := SpeciesDB.get_def(&"narfin")
+	check("resistances are read", float(narfin.resists.get(Blocks.ELEM_ICE, 1.0)) == 0.0)
 
 	# a generated weapon should be a valid, better-than-base stack
 	var rng := RandomNumberGenerator.new()
@@ -318,6 +327,116 @@ func _combat() -> void:
 	await _settle(3)
 	check("killing a monster drops loot",
 		game.drops_root.get_child_count() >= drops_before)
+
+
+## Crouch has to change the shape the world is swept against, not just the
+## picture, or none of it is worth anything.
+func _crouch() -> void:
+	var feet := player.feet_block()
+	# somewhere flat with headroom
+	for dy in range(0, 4):
+		for dx in range(-1, 2):
+			for dz in range(-1, 2):
+				world.set_block(feet.x + dx, feet.y + dy, feet.z + dz, Blocks.AIR)
+	for dx in range(-1, 2):
+		for dz in range(-1, 2):
+			world.set_block(feet.x + dx, feet.y - 1, feet.z + dz, Blocks.STONE)
+	player.global_position = Vector3(feet.x + 0.5, float(feet.y), feet.z + 0.5)
+	await _settle(4)
+
+	var standing_noise := player.noise_radius()
+	check("standing tall by default", not player.crouching
+		and is_equal_approx(player.half.y, Player.HALF.y))
+
+	Input.action_press(&"crouch")
+	await _settle(6)
+	check("crouch engages on the ground", player.crouching)
+	check("the hitbox actually shrinks", player.half.y < Player.HALF.y,
+		"%.2f -> %.2f" % [Player.HALF.y, player.half.y])
+	check("crouching is quieter than standing",
+		player.noise_radius() < standing_noise,
+		"%.1f -> %.1f" % [standing_noise, player.noise_radius()])
+
+	# a one-block gap is passable crouched and not standing
+	var gap := Vector3i(feet.x + 2, feet.y, feet.z)
+	world.set_block(gap.x, gap.y, gap.z, Blocks.AIR)
+	world.set_block(gap.x, gap.y + 1, gap.z, Blocks.STONE)
+	var crouched_fits := not world.box_overlaps(
+		Vector3(gap) + Vector3(0.5, player.half.y, 0.5), player.half)
+	var standing_fits := not world.box_overlaps(
+		Vector3(gap) + Vector3(0.5, Player.HALF.y, 0.5), Player.HALF)
+	check("a one-block gap only admits you crouched",
+		crouched_fits and not standing_fits)
+
+	Input.action_release(&"crouch")
+	await _settle(8)
+	check("standing up again", not player.crouching)
+	world.set_block(gap.x, gap.y + 1, gap.z, Blocks.AIR)
+
+
+## The roster is the hand-made Starbound creatures, and they behave like
+## characters rather than like one chase loop with different numbers.
+func _bestiary() -> void:
+	for id: StringName in [&"poptop", &"gleap", &"yokat", &"hypnare",
+			&"mandraflora", &"crustoise", &"pteropod", &"narfin", &"voltip",
+			&"fennix", &"lumoth", &"oculob", &"batong", &"anglure", &"scandroid"]:
+		check("%s is in the bestiary" % id, SpeciesDB.get_def(id) != null)
+
+	var tempers := {}
+	for d: SpeciesDB.Def in SpeciesDB.defs:
+		tempers[d.temperament] = true
+	check("every temperament is represented", tempers.size() >= 5,
+		"%d kinds" % tempers.size())
+
+	var poptop := SpeciesDB.get_def(&"poptop")
+	check("poptops graze", poptop.grazes and not poptop.diet.is_empty())
+	check("poptops keep daylight hours", poptop.is_awake(false)
+		and not poptop.is_awake(true))
+
+	var hypnare := SpeciesDB.get_def(&"hypnare")
+	check("the hypnare never starts a fight", not hypnare.will_fight())
+	check("...but it does hit back", hypnare.flags.has(&"retaliates"))
+
+	var crustoise := SpeciesDB.get_def(&"crustoise")
+	check("the crustoise has a shell to break", crustoise.armour_hp > 0.0)
+
+	var batong := SpeciesDB.get_def(&"batong")
+	check("the batong hunts by ear, not by eye",
+		batong.hearing > batong.sight and batong.sight_cone < 0.0)
+
+	# --- a shelled creature soaks until the shell is gone
+	var feet := player.feet_block()
+	var m: Monster = game.spawn_monster(&"crustoise",
+		Vector3(feet.x + 5, feet.y + 1, feet.z), 1.0)
+	if m != null:
+		var shell_before: float = m.shell
+		var hp_before: float = m.health
+		m.hurt(20.0, Blocks.ELEM_PHYSICAL, Vector3.ZERO, player)
+		check("a shell soaks damage", m.health > hp_before - 20.0 and m.shell < shell_before,
+			"hp %.0f -> %.0f" % [hp_before, m.health])
+		m.queue_free()
+
+	# --- taming: the right food, offered to a calm creature
+	var t: Monster = game.spawn_monster(&"yokat",
+		Vector3(feet.x + 7, feet.y + 1, feet.z), 1.0)
+	if t != null:
+		t.alert = 0.0
+		t.fear = 0.0
+		check("a creature refuses food it does not eat", not t.offer(&"cobblestone"))
+		check("a creature takes food it does eat", t.offer(&"wheat"))
+		t.alert = 0.0
+		t.fear = 0.0
+		t.offer(&"wheat")
+		t.alert = 0.0
+		t.fear = 0.0
+		t.offer(&"wheat")
+		check("enough of it wins the creature over", t.tamed)
+		check("a tamed creature is not hostile", not t.is_hostile())
+		t.queue_free()
+
+	check("no procedurally generated species are in the pool",
+		SpeciesDB.pool_for(&"forest", 9).all(
+			func(d: SpeciesDB.Def) -> bool: return d.description != ""))
 
 
 func _quests() -> void:
@@ -362,6 +481,87 @@ func _cutaway() -> void:
 	check("disabling the cutaway cuts nothing",
 		not cut.is_cut(int(floor(mid.x)), int(floor(mid.y)), int(floor(mid.z))))
 	world.set_cutaway_enabled(true)
+
+
+## The rules that were added because the cutaway was eating the things the
+## player was trying to mine.
+func _cutaway_modes() -> void:
+	var cut := world.cutaway
+	var feet := player.feet_block()
+	# put the camera up and behind, the way the rig actually sits
+	var target := player.global_position
+	var cam := target + Vector3(0.0, 15.0, -22.0)
+	world.update_cutaway(cam, target)
+
+	# --- the keep shell
+	var below := Vector3i(feet.x, feet.y - 1, feet.z)
+	check("the block under your feet is never cut",
+		not cut.is_cut(below.x, below.y, below.z))
+
+	var side := Vector3i(feet.x + 1, feet.y, feet.z)
+	world.set_block(side.x, side.y, side.z, Blocks.LOG)
+	check("a trunk you have walked up to is never cut",
+		not cut.is_cut(side.x, side.y, side.z), str(side))
+
+	var away := Vector3i(feet.x, feet.y, feet.z + 2)
+	check("a block on the far side from the lens is never cut",
+		not cut.is_cut(away.x, away.y, away.z))
+
+	# ...but the shell must not protect what is genuinely in the way
+	var toward := Vector3i(feet.x, feet.y + 2, feet.z - 2)
+	check("a block between you and the lens is still cut",
+		cut.is_cut(toward.x, toward.y, toward.z), str(toward))
+
+	# --- and the trunk must be aimable, which is what the quest needs
+	var eye := target + Vector3(0, 1.0, 0)
+	var to_log := (Vector3(side) + Vector3(0.5, 0.5, 0.5)) - eye
+	var hit := world.raycast(eye, to_log.normalized(), 6.0, true)
+	check("the trunk can still be aimed at",
+		hit.get("hit", false) and hit.get("block") == side,
+		str(hit.get("block", "nothing")))
+	world.set_block(side.x, side.y, side.z, Blocks.AIR)
+
+	# --- fill only travels through covered air
+	var roofed := Vector3i(feet.x + 6, feet.y, feet.z)
+	for dy in range(0, 4):
+		for dx in range(-1, 4):
+			for dz in range(-2, 3):
+				world.set_block(roofed.x + dx, roofed.y + dy, roofed.z + dz, Blocks.AIR)
+	for dx in range(-1, 4):
+		for dz in range(-2, 3):
+			world.set_block(roofed.x + dx, roofed.y + 4, roofed.z + dz, Blocks.STONE)
+	check("a roofed pocket counts as covered",
+		world.is_covered(roofed.x, roofed.y, roofed.z))
+	check("open sky does not count as covered",
+		not world.is_covered(feet.x, VoxelWorld.WH - 2, feet.z))
+
+	world.set_cutaway_mode(Cutaway.Mode.FILL)
+	world.update_cutaway(cam, target)
+	world._rebuild_fill()
+	check("fill mode produces a volume", cut.fill_size.x > 0)
+	check("fill never marks the open sky",
+		not cut.in_fill(feet.x, VoxelWorld.WH - 2, feet.z))
+
+	# --- planar stays dormant until something is genuinely in the way
+	world.set_cutaway_mode(Cutaway.Mode.PLANAR)
+	cut.occluded = false
+	var front := Vector3i(feet.x, feet.y + 1, feet.z - 6)
+	check("planar cuts nothing while you are in the open",
+		not cut.is_cut(front.x, front.y, front.z))
+	cut.occluded = true
+	check("planar cuts the slab in front once you are covered",
+		cut.is_cut(front.x, front.y, front.z), str(front))
+	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+
+	# --- presentation toggles
+	world.set_cutaway_opacity(0.5)
+	check("ghosts fade with distance from the player",
+		cut.ghost_alpha(target + Vector3(1, 0, 0))
+		> cut.ghost_alpha(target + Vector3(12, 0, 0)))
+	check("ghosts are targetable once visible", cut.selectable_in_primary())
+	world.set_cutaway_opacity(0.0)
+	check("deleted blocks are not targetable in the primary pass",
+		not cut.selectable_in_primary())
 
 
 func _space() -> void:

@@ -55,7 +55,7 @@ static func rarity_for(tier: int) -> int:
 # ===========================================================================
 static func _manipulator() -> void:
 	Items.define(&"matter_manipulator", "Matter Manipulator") \
-		.as_tool(&"beam", 0, 1.0, 6.0) \
+		.as_tool(&"beam", 0, 1.0, 60.0) \
 		.look(Color(0.55, 0.95, 0.85), &"probe") \
 		.worth(0, Items.RARITY_ESSENTIAL).in_category(&"tools") \
 		.tag(&"tool").tag(&"essential").tag(&"beam").tag(&"no_sell") \

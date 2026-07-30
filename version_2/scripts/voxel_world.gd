@@ -17,6 +17,13 @@ const COLS := CW * CW
 const EXT := CW + 2            ## padded column grid used while meshing
 const SEA := 12
 
+## Flood-fill budget. The box has to reach the camera as well as the pocket, so
+## it is centred on the player and sized to cover the lens at full zoom.
+const FILL_EXTENT := Vector3i(52, 48, 52)
+const MAX_FILL_CELLS := 3000
+const MAX_SHADOW_STEPS := 46
+const MAX_MARKED_CELLS := 26000
+
 @export var view_radius := 5
 @export var gen_budget_us := 6000
 @export var mesh_budget_us := 6000
@@ -80,6 +87,15 @@ var mat_cap: ShaderMaterial
 var cutaway := Cutaway.new()
 var _cap_mi: MeshInstance3D
 var _cap_dirty := true
+
+## The flood-fill volume is expensive to rebuild, so it is only redone when the
+## player crosses a block boundary or the camera swings — not every frame the
+## way the caps are.
+var _fill_dirty := true
+var _fill_anchor := Vector3i(9999, 9999, 9999)
+var _fill_cam := Vector3i(9999, 9999, 9999)
+var _fill_img: Image
+var _fill_tex: ImageTexture
 
 ## Terrain, biomes, ores and structures all live in the generator, so a planet
 ## is a configuration rather than a code path.
@@ -331,9 +347,21 @@ func _process(_delta: float) -> void:
 			_initial_done = true
 			world_ready.emit()
 
+	# The fill is the expensive one, so it is rebuilt on block-boundary crossings
+	# rather than per frame — and in fill mode the caps ride along with it,
+	# because re-walking a mask of thousands of cells every frame would cost far
+	# more than the sub-block lag is worth.
+	var fill_rebuilt := false
+	if cutaway.mode == Cutaway.Mode.FILL and cutaway.enabled and _fill_dirty:
+		_fill_dirty = false
+		_rebuild_fill()
+		fill_rebuilt = true
+		_cap_dirty = true
+
 	if _cap_dirty:
-		_cap_dirty = false
-		_rebuild_caps()
+		if cutaway.mode != Cutaway.Mode.FILL or fill_rebuilt or not cutaway.enabled:
+			_cap_dirty = false
+			_rebuild_caps()
 
 
 ## A chunk can only be meshed once its 8 neighbours exist, otherwise we would
@@ -1287,18 +1315,66 @@ func _faces_to_arrays(fpos: PackedInt32Array, fmeta: PackedInt32Array) -> Array:
 # =============================================================================
 
 func update_cutaway(cam_pos: Vector3, target_pos: Vector3) -> void:
-	if cutaway.camera_position.is_equal_approx(cam_pos) and cutaway.target_position.is_equal_approx(target_pos):
+	if cutaway.camera_position.is_equal_approx(cam_pos) \
+			and cutaway.target_position.is_equal_approx(target_pos):
 		return
 	cutaway.camera_position = cam_pos
 	cutaway.target_position = target_pos
 	_cap_dirty = true
+
+	# The planar slab only exists while something is genuinely in the way, so
+	# an open landscape is never sliced for no reason.
+	if cutaway.mode == Cutaway.Mode.PLANAR:
+		var was := cutaway.occluded
+		cutaway.occluded = _is_occluded(cam_pos, target_pos)
+		if was != cutaway.occluded:
+			_cap_dirty = true
+
+	var anchor := Vector3i(floori(target_pos.x), floori(target_pos.y), floori(target_pos.z))
+	var cam_cell := Vector3i(floori(cam_pos.x), floori(cam_pos.y), floori(cam_pos.z))
+	if anchor != _fill_anchor or (cam_cell - _fill_cam).length_squared() > 9:
+		_fill_anchor = anchor
+		_fill_cam = cam_cell
+		_fill_dirty = true
+
+
+func set_cutaway_mode(m: int) -> void:
+	if cutaway.mode == m:
+		return
+	cutaway.mode = m
+	cutaway.clear_fill()
+	_fill_dirty = true
+	_cap_dirty = true
+
+
+## Is the straight line from the lens to the player actually blocked? Only the
+## planar mode needs to know, and only so it can stay dormant in the open.
+func _is_occluded(cam_pos: Vector3, target_pos: Vector3) -> bool:
+	var to := (target_pos + Vector3(0, 0.9, 0)) - cam_pos
+	var dist := to.length()
+	if dist < 0.01:
+		return false
+	var hit := raycast(cam_pos, to / dist, dist, false)
+	return hit.get("hit", false)
 
 
 func set_cutaway_enabled(v: bool) -> void:
 	if cutaway.enabled == v:
 		return
 	cutaway.enabled = v
+	_fill_dirty = true
 	_cap_dirty = true
+
+
+## Ghost opacity and the mine-through toggle. Both are pure presentation, but
+## the caps change with them, so they go through here.
+func set_cutaway_opacity(v: float) -> void:
+	cutaway.opacity = clampf(v, 0.0, 1.0)
+	_cap_dirty = true
+
+
+func set_cutaway_selectable(v: bool) -> void:
+	cutaway.selectable = v
 
 
 ## True while the world is actually being sliced open for the camera.
@@ -1320,6 +1396,210 @@ static func dir_index(v: Vector3i) -> int:
 	return 5
 
 
+# =============================================================================
+# the flood-filled cut volume
+# =============================================================================
+
+## Build the FILL mode's cut set: the air pocket the player is standing in, plus
+## everything between that whole pocket and the lens, plus the ordinary
+## cylinder. Packed straight into the z-slice grid the shader samples, so there
+## is no repacking pass between here and the GPU.
+func _rebuild_fill() -> void:
+	var cut := cutaway
+	var target := cut.target_position
+	var cam := cut.camera_position
+
+	var origin := Vector3i(
+		floori(target.x) - FILL_EXTENT.x / 2,
+		0,
+		floori(target.z) - FILL_EXTENT.z / 2)
+	var size := Vector3i(FILL_EXTENT.x, mini(FILL_EXTENT.y, WH), FILL_EXTENT.z)
+	var cols := int(ceil(sqrt(float(size.z))))
+	var rows := int(ceil(float(size.z) / float(cols)))
+	var width := cols * size.x
+	var height := rows * size.y
+
+	var mask := PackedByteArray()
+	mask.resize(width * height)
+	mask.fill(0)
+
+	cut.fill_origin = origin
+	cut.fill_size = size
+	cut.fill_cols = cols
+	cut.fill_width = width
+	cut.fill_mask = mask
+
+	var marked := PackedInt32Array()
+
+	# --- 1. the pocket. Seeded at the player, who is by definition standing in
+	# it, and again where the sightline first breaks into open air, so a player
+	# wedged into a crevice still lights up the room they are looking into.
+	var queue: Array[Vector3i] = []
+	var start := Vector3i(floori(target.x), floori(target.y + 0.9), floori(target.z))
+	if is_covered(start.x, start.y, start.z):
+		_seed_fill(start, queue, marked)
+	var breach := _first_air_toward(cam, target)
+	if breach.y >= 0 and is_covered(breach.x, breach.y, breach.z):
+		_seed_fill(breach, queue, marked)
+
+	var filled := 0
+	var head := 0
+	while head < queue.size() and filled < MAX_FILL_CELLS:
+		var c: Vector3i = queue[head]
+		head += 1
+		filled += 1
+		for d: Vector3i in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0),
+				Vector3i(0, -1, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
+			var n := c + d
+			if is_solid_at(n.x, n.y, n.z) or not is_covered(n.x, n.y, n.z):
+				continue
+			_seed_fill(n, queue, marked)
+
+	# --- 2. the shadow: from every cell of the pocket, march to the lens.
+	# Marching stops the moment it meets a cell some other ray already marked —
+	# the camera is far enough away that those rays are near-parallel, so the
+	# suffix is already done and re-walking it would only cost time.
+	var pocket := marked.duplicate()
+	for i in pocket.size():
+		if marked.size() > MAX_MARKED_CELLS:
+			break
+		_shadow_toward_camera(_unpack(pocket[i]), cam, marked)
+
+	# --- 3. the ordinary cylinder, so the mask is the whole cut set and the cap
+	# builder can iterate it instead of scanning a volume.
+	_mark_cylinder(marked)
+
+	_upload_fill(width, height)
+
+
+## Mark one cell if it is inside the box and not already marked.
+func _seed_fill(c: Vector3i, queue: Array[Vector3i], marked: PackedInt32Array,
+		expand := true) -> void:
+	var cut := cutaway
+	var lx := c.x - cut.fill_origin.x
+	var ly := c.y - cut.fill_origin.y
+	var lz := c.z - cut.fill_origin.z
+	if lx < 0 or ly < 0 or lz < 0:
+		return
+	if lx >= cut.fill_size.x or ly >= cut.fill_size.y or lz >= cut.fill_size.z:
+		return
+	var idx := cut.packed_index(lx, ly, lz)
+	if cut.fill_mask[idx] != 0:
+		return
+	cut.fill_mask[idx] = 1
+	marked.append(_pack(c))
+	if expand:
+		queue.append(c)
+
+
+func _pack(c: Vector3i) -> int:
+	var cut := cutaway
+	return ((c.z - cut.fill_origin.z) * cut.fill_size.y
+		+ (c.y - cut.fill_origin.y)) * cut.fill_size.x + (c.x - cut.fill_origin.x)
+
+
+func _unpack(i: int) -> Vector3i:
+	var cut := cutaway
+	var lx := i % cut.fill_size.x
+	var rest := i / cut.fill_size.x
+	var ly := rest % cut.fill_size.y
+	var lz := rest / cut.fill_size.y
+	return Vector3i(lx, ly, lz) + cut.fill_origin
+
+
+## March from a pocket cell to the lens, marking whatever is in the way.
+func _shadow_toward_camera(from: Vector3i, cam: Vector3, marked: PackedInt32Array) -> void:
+	var p := Vector3(from) + Vector3(0.5, 0.5, 0.5)
+	var dir := cam - p
+	var dist := dir.length()
+	if dist < 0.001:
+		return
+	dir /= dist
+	var steps := mini(int(dist / 0.6), MAX_SHADOW_STEPS)
+	var cut := cutaway
+	for i in range(1, steps + 1):
+		var w := p + dir * (float(i) * 0.6)
+		var c := Vector3i(floori(w.x), floori(w.y), floori(w.z))
+		var lx := c.x - cut.fill_origin.x
+		var ly := c.y - cut.fill_origin.y
+		var lz := c.z - cut.fill_origin.z
+		if lx < 0 or ly < 0 or lz < 0:
+			return
+		if lx >= cut.fill_size.x or ly >= cut.fill_size.y or lz >= cut.fill_size.z:
+			return
+		var idx := cut.packed_index(lx, ly, lz)
+		if cut.fill_mask[idx] != 0:
+			return                      # already walked from here to the lens
+		cut.fill_mask[idx] = 1
+		marked.append(_pack(c))
+
+
+func _mark_cylinder(marked: PackedInt32Array) -> void:
+	var cut := cutaway
+	var scratch: Array[Vector3i] = []
+	var pad := cut.radius + cut.target_padding
+	var lo := cut.camera_position.min(cut.target_position) - Vector3(pad, pad, pad)
+	var hi := cut.camera_position.max(cut.target_position) + Vector3(pad, pad, pad)
+	for x in range(floori(lo.x), ceili(hi.x)):
+		for y in range(maxi(floori(lo.y), 0), mini(ceili(hi.y), WH)):
+			for z in range(floori(lo.z), ceili(hi.z)):
+				if not cut.in_cylinder(Vector3(x + 0.5, y + 0.5, z + 0.5)):
+					continue
+				_seed_fill(Vector3i(x, y, z), scratch, marked, false)
+
+
+## Is there anything solid above this cell? The flood fill only travels through
+## covered air, which is what confines it to the tunnel or the room the player
+## is actually in. Without it a doorway leaks the fill into the open sky and the
+## whole landscape gets removed.
+func is_covered(gx: int, gy: int, gz: int) -> bool:
+	if gy < 0 or gy >= WH - 1:
+		return false
+	return (solid_mask_at(gx, gz) >> (gy + 1)) != 0
+
+
+## Where does the line from the lens to the player first break into open air?
+func _first_air_toward(cam: Vector3, target: Vector3) -> Vector3i:
+	var to := (target + Vector3(0, 0.9, 0)) - cam
+	var dist := to.length()
+	if dist < 0.01:
+		return Vector3i(0, -1, 0)
+	var dir := to / dist
+	var seen_solid := false
+	var steps := int(dist / 0.5)
+	for i in range(steps + 1):
+		var w := cam + dir * (float(i) * 0.5)
+		var c := Vector3i(floori(w.x), floori(w.y), floori(w.z))
+		if c.y < 0 or c.y >= WH:
+			continue
+		if is_solid_at(c.x, c.y, c.z):
+			seen_solid = true
+		elif seen_solid:
+			return c                    # the far side of whatever was in the way
+	return Vector3i(0, -1, 0)
+
+
+## Hand the packed mask to the terrain materials. One R8 image, no mipmaps, so
+## the upload is a straight memcpy of the array we already built.
+func _upload_fill(width: int, height: int) -> void:
+	var cut := cutaway
+	if _fill_img == null or _fill_img.get_width() != width \
+			or _fill_img.get_height() != height:
+		_fill_img = Image.create_from_data(width, height, false, Image.FORMAT_R8,
+			cut.fill_mask)
+		_fill_tex = ImageTexture.create_from_image(_fill_img)
+	else:
+		_fill_img.set_data(width, height, false, Image.FORMAT_R8, cut.fill_mask)
+		_fill_tex.update(_fill_img)
+	for mat in [mat_opaque, mat_glass, mat_cross, mat_cap]:
+		if mat == null:
+			continue
+		mat.set_shader_parameter("cut_fill_tex", _fill_tex)
+		mat.set_shader_parameter("cut_fill_origin", Vector3(cut.fill_origin))
+		mat.set_shader_parameter("cut_fill_size", Vector3(cut.fill_size))
+		mat.set_shader_parameter("cut_fill_cols", float(cut.fill_cols))
+
+
 ## Walks the boundary of the cut volume and emits every face that the discard in
 ## voxel.gdshader just exposed. Without this you would be looking at the inside
 ## of the terrain shell, which has no geometry at all.
@@ -1327,46 +1607,17 @@ func _rebuild_caps() -> void:
 	var cut := cutaway
 	cut.push_to_shader_globals()
 
-	var caps: Array = []
-
 	if not cut.enabled:
 		_cap_mi.mesh = null
 		return
 
-	var bounds := cut.get_int_bounds()
-	var cam := cut.camera_position
-	var target := cut.target_position
-	var R := cut.radius
-	var P := cut.target_padding
-
-	for x in range(bounds.position.x, bounds.end.x):
-		for y in range(bounds.position.y, bounds.end.y):
-			for z in range(bounds.position.z, bounds.end.z):
-				if not cut.is_cut(x, y, z):
-					continue
-				
-				var b_up := get_block(x, y + 1, z)
-				var b_dn := get_block(x, y - 1, z)
-				var b_px := get_block(x + 1, y, z)
-				var b_nx := get_block(x - 1, y, z)
-				var b_pz := get_block(x, y, z + 1)
-				var b_nz := get_block(x, y, z - 1)
-				
-				var pos := Vector3(x, y, z)
-				var dist_to_cam := pos.distance_to(cam)
-				
-				if b_up != Blocks.AIR and Blocks.is_opaque(b_up) and not cut.is_cut(x, y + 1, z):
-					_cap_face(caps, Vector3i(x, y + 1, z), 3, dist_to_cam) # -Y face of block above
-				if b_dn != Blocks.AIR and Blocks.is_opaque(b_dn) and not cut.is_cut(x, y - 1, z):
-					_cap_face(caps, Vector3i(x, y - 1, z), 2, dist_to_cam) # +Y face of block below
-				if b_px != Blocks.AIR and Blocks.is_opaque(b_px) and not cut.is_cut(x + 1, y, z):
-					_cap_face(caps, Vector3i(x + 1, y, z), 1, dist_to_cam) # -X face of block +X
-				if b_nx != Blocks.AIR and Blocks.is_opaque(b_nx) and not cut.is_cut(x - 1, y, z):
-					_cap_face(caps, Vector3i(x - 1, y, z), 0, dist_to_cam) # +X face of block -X
-				if b_pz != Blocks.AIR and Blocks.is_opaque(b_pz) and not cut.is_cut(x, y, z + 1):
-					_cap_face(caps, Vector3i(x, y, z + 1), 5, dist_to_cam) # -Z face of block +Z
-				if b_nz != Blocks.AIR and Blocks.is_opaque(b_nz) and not cut.is_cut(x, y, z - 1):
-					_cap_face(caps, Vector3i(x, y, z - 1), 4, dist_to_cam) # +Z face of block -Z
+	var caps: Array = []
+	# FILL already holds its whole cut set as a dense mask, so walking that is
+	# strictly cheaper than rescanning the volume it came from.
+	if cut.mode == Cutaway.Mode.FILL and not cut.fill_mask.is_empty():
+		_caps_from_mask(caps)
+	else:
+		_caps_from_bounds(caps)
 
 	if caps.is_empty():
 		_cap_mi.mesh = null
@@ -1376,6 +1627,77 @@ func _rebuild_caps() -> void:
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _cap_arrays(caps))
 	mesh.surface_set_material(0, mat_cap)
 	_cap_mi.mesh = mesh
+
+
+func _caps_from_bounds(caps: Array) -> void:
+	var cut := cutaway
+	var bounds := cut.get_int_bounds()
+	var cam := cut.camera_position
+	var y0 := maxi(int(bounds.position.y), 0)
+	var y1 := mini(int(bounds.end.y), WH)
+	for x in range(bounds.position.x, bounds.end.x):
+		for z in range(bounds.position.z, bounds.end.z):
+			# A cut cell only matters if it has a solid neighbour to expose, so a
+			# column with nothing in it or beside it can be skipped whole. Open
+			# sky is most of the volume in every mode.
+			var occupied := solid_mask_at(x, z) | solid_mask_at(x + 1, z) \
+				| solid_mask_at(x - 1, z) | solid_mask_at(x, z + 1) \
+				| solid_mask_at(x, z - 1)
+			if occupied == 0:
+				continue
+			for y in range(y0, y1):
+				if (occupied >> y) & 1 == 0 and (occupied >> maxi(y - 1, 0)) & 1 == 0 \
+						and (occupied >> mini(y + 1, WH - 1)) & 1 == 0:
+					continue
+				if not cut.is_cut(x, y, z):
+					continue
+				_cap_neighbours(caps, x, y, z, cam)
+
+
+func _caps_from_mask(caps: Array) -> void:
+	var cut := cutaway
+	var cam := cut.camera_position
+	var size := cut.fill_size
+	var origin := cut.fill_origin
+	var mask := cut.fill_mask
+	for lz in size.z:
+		for ly in size.y:
+			var base := cut.packed_index(0, ly, lz)
+			for lx in size.x:
+				if mask[base + lx] == 0:
+					continue
+				var x := origin.x + lx
+				var y := origin.y + ly
+				var z := origin.z + lz
+				# the keep shell is evaluated per frame, not baked into the mask
+				if cut.is_protected(Vector3(x + 0.5, y + 0.5, z + 0.5)):
+					continue
+				_cap_neighbours(caps, x, y, z, cam)
+
+
+## Emit the faces the discard just exposed around one cut cell.
+func _cap_neighbours(caps: Array, x: int, y: int, z: int, cam: Vector3) -> void:
+	var cut := cutaway
+	var dist_to_cam := Vector3(x, y, z).distance_to(cam)
+
+	var b_up := get_block(x, y + 1, z)
+	if b_up != Blocks.AIR and Blocks.is_opaque(b_up) and not cut.is_cut(x, y + 1, z):
+		_cap_face(caps, Vector3i(x, y + 1, z), 3, dist_to_cam)  # -Y of the block above
+	var b_dn := get_block(x, y - 1, z)
+	if b_dn != Blocks.AIR and Blocks.is_opaque(b_dn) and not cut.is_cut(x, y - 1, z):
+		_cap_face(caps, Vector3i(x, y - 1, z), 2, dist_to_cam)
+	var b_px := get_block(x + 1, y, z)
+	if b_px != Blocks.AIR and Blocks.is_opaque(b_px) and not cut.is_cut(x + 1, y, z):
+		_cap_face(caps, Vector3i(x + 1, y, z), 1, dist_to_cam)
+	var b_nx := get_block(x - 1, y, z)
+	if b_nx != Blocks.AIR and Blocks.is_opaque(b_nx) and not cut.is_cut(x - 1, y, z):
+		_cap_face(caps, Vector3i(x - 1, y, z), 0, dist_to_cam)
+	var b_pz := get_block(x, y, z + 1)
+	if b_pz != Blocks.AIR and Blocks.is_opaque(b_pz) and not cut.is_cut(x, y, z + 1):
+		_cap_face(caps, Vector3i(x, y, z + 1), 5, dist_to_cam)
+	var b_nz := get_block(x, y, z - 1)
+	if b_nz != Blocks.AIR and Blocks.is_opaque(b_nz) and not cut.is_cut(x, y, z - 1):
+		_cap_face(caps, Vector3i(x, y, z - 1), 4, dist_to_cam)
 
 
 func _cap_face(caps: Array, cell: Vector3i, dir: int, dist: float) -> void:
@@ -1446,9 +1768,24 @@ func _cap_arrays(caps: Array) -> Array:
 # raycasting
 # =============================================================================
 
-## Amanatides & Woo voxel traversal. Blocks removed by the cutaway are skipped,
-## so you can always mine and place whatever you can actually see.
+## Amanatides & Woo voxel traversal.
+##
+## Blocks removed by the cutaway are skipped, so you always target what you can
+## actually see. Two exceptions: when cut blocks are drawn as ghosts they are
+## visible, so they are targetable in the primary pass; and when the primary
+## pass finds nothing at all, a second pass ignores the cut entirely, so a
+## cutaway can never leave you unable to mine something that is really there.
 func raycast(from: Vector3, dir: Vector3, max_dist: float, respect_cutaway := true) -> Dictionary:
+	if respect_cutaway and not cutaway.selectable_in_primary():
+		var seen := _raycast_pass(from, dir, max_dist, true)
+		if seen.get("hit", false) or not cutaway.selectable:
+			return seen
+		return _raycast_pass(from, dir, max_dist, false)
+	return _raycast_pass(from, dir, max_dist, false)
+
+
+func _raycast_pass(from: Vector3, dir: Vector3, max_dist: float,
+		respect_cutaway: bool) -> Dictionary:
 	var result := {"hit": false}
 	if dir.length_squared() < 0.0001:
 		return result

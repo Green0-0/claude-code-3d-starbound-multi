@@ -282,6 +282,14 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event.is_action_pressed(&"toggle_cutaway"):
 		world.set_cutaway_enabled(not world.cutaway.enabled)
 		notify("Cutaway %s." % ("on" if world.cutaway.enabled else "off"), &"info")
+	elif event.is_action_pressed(&"cutaway_mode"):
+		_cycle_cutaway_mode()
+	elif event.is_action_pressed(&"cutaway_opacity"):
+		_cycle_cutaway_opacity()
+	elif event.is_action_pressed(&"cutaway_select"):
+		world.set_cutaway_selectable(not world.cutaway.selectable)
+		notify("Cut blocks are %s." % ("mineable" if world.cutaway.selectable
+			else "locked"), &"info")
 	elif event.is_action_pressed(&"quick_save"):
 		save_game()
 		notify("Saved.", &"info")
@@ -318,6 +326,37 @@ func _unhandled_input(event: InputEvent) -> void:
 				player.select_slot(i)
 				hud.flash_stack(player.held_stack())
 				return
+
+
+## The three cut shapes, in the order they are worth trying: the drill, the
+## whole-room fill, and the flat cross-section.
+func _cycle_cutaway_mode() -> void:
+	var next := wrapi(world.cutaway.mode + 1, 0, 3)
+	world.set_cutaway_mode(next)
+	var blurb := {
+		Cutaway.Mode.CYLINDER: "a drill from the lens to you",
+		Cutaway.Mode.FILL: "the whole room or tunnel you are standing in",
+		Cutaway.Mode.PLANAR: "a flat slab in front of you when you are covered",
+	}
+	notify("Cutaway: %s — %s." % [world.cutaway.mode_name(), blurb[next]], &"info")
+
+
+## Off, ghost, or solid-ish. Zero deletes cut blocks outright; anything above
+## draws them as dithered ghosts that thin out with distance from you.
+func _cycle_cutaway_opacity() -> void:
+	const STEPS := [0.0, 0.35, 0.65]
+	var current := world.cutaway.opacity
+	var index := 0
+	for i in STEPS.size():
+		if is_equal_approx(current, STEPS[i]):
+			index = i
+	var next: float = STEPS[wrapi(index + 1, 0, STEPS.size())]
+	world.set_cutaway_opacity(next)
+	if next <= 0.0:
+		notify("Cut blocks removed outright.", &"info")
+	else:
+		notify("Cut blocks ghosted at %d%%, fading over %d blocks."
+			% [int(next * 100.0), int(world.cutaway.fade_distance)], &"info")
 
 
 func _drop_held() -> void:
@@ -697,7 +736,11 @@ func quick_deposit(container: PlacedObject) -> void:
 # =============================================================================
 
 func player_interact(who: Player) -> void:
-	# NPCs first: they are what you usually mean
+	# A creature you are holding food for comes before anything else, because
+	# that is unambiguously what you meant by walking up to it holding food.
+	if _try_feed(who):
+		return
+	# NPCs next: they are what you usually mean
 	var npc := _nearest(npcs_root, who.global_position, 3.2) as Npc
 	if npc != null:
 		ui.open_dialogue(npc)
@@ -727,6 +770,37 @@ func player_interact(who: Player) -> void:
 			_use_utility(obj)
 		_:
 			obj.interact(who)
+
+
+## Offer the held stack to the nearest creature that eats it. Works best while
+## crouched and at a distance it has not already panicked at.
+func _try_feed(who: Player) -> bool:
+	var stack := who.held_stack()
+	if stack.is_empty():
+		return false
+	var best: Monster = null
+	var best_d := 4.0
+	for n in monsters_root.get_children():
+		var m := n as Monster
+		if m == null or m.tamed or not m.species.likes(stack.id):
+			continue
+		var d := m.global_position.distance_to(who.global_position)
+		if d < best_d:
+			best_d = d
+			best = m
+	if best == null:
+		return false
+	if not best.offer(stack.id):
+		notify("The %s is too worked up to take it." % best.display_name(), &"warn")
+		return true
+	stack.count -= 1
+	if stack.count <= 0:
+		stack.clear()
+	who.inventory.changed.emit()
+	bump_stat("creatures_fed", 1)
+	if not best.tamed:
+		notify("The %s eats, and watches you." % best.display_name(), &"info")
+	return true
 
 
 func _use_utility(obj: PlacedObject) -> void:
@@ -1003,11 +1077,20 @@ func _tick_population() -> void:
 	_populate_structures()
 
 
+## Stock the area around the player. Cave-dwellers only appear underground and
+## surface creatures only above it, and anything currently asleep is much less
+## likely to be placed — a nocturnal roster genuinely thins out by day.
 func _spawn_monster_near_player() -> void:
+	var underground := _player_is_underground()
 	var pool := SpeciesDB.pool_for(world.gen.biome, world.gen.threat + 1)
-	if pool.is_empty():
+	var eligible: Array[SpeciesDB.Def] = []
+	for d: SpeciesDB.Def in pool:
+		if bool(d.flags.get(&"underground", false)) != underground:
+			continue
+		eligible.append(d)
+	if eligible.is_empty():
 		return
-	# night is when the dangerous half of the roster comes out
+
 	var night: bool = sky.is_night()
 	for attempt in 24:
 		var a := _rng.randf() * TAU
@@ -1016,19 +1099,46 @@ func _spawn_monster_near_player() -> void:
 		var z := int(floor(player.global_position.z + sin(a) * r))
 		if not world.is_loaded(x, z):
 			continue
-		var top := world.column_top(x, z)
-		if top < 4 or top >= VoxelWorld.WH - 3:
+		var spot := _spawn_spot(x, z, underground)
+		if spot.y < 0:
 			continue
-		if world.is_solid_at(x, top + 1, z) or world.is_solid_at(x, top + 2, z):
+		var def: SpeciesDB.Def = eligible[_rng.randi() % eligible.size()]
+		if not def.is_awake(night) and _rng.randf() < 0.75:
 			continue
-		var def: SpeciesDB.Def = pool[_rng.randi() % pool.size()]
-		if not night and def.threat >= 3 and _rng.randf() < 0.7:
+		if not night and def.threat >= 3 and _rng.randf() < 0.6:
 			continue
 		var count := _rng.randi_range(def.pack_min, def.pack_max)
 		for i in count:
-			var at := Vector3(x + 0.5 + float(i) * 0.8, float(top) + 1.1, z + 0.5)
+			var at := Vector3(spot) + Vector3(0.5 + float(i) * 0.8, 0.1, 0.5)
 			spawn_monster(def.id, at, 1.0 + float(world.gen.threat) * 0.22)
 		return
+
+
+func _player_is_underground() -> bool:
+	var feet := player.feet_block()
+	return world.column_top(feet.x, feet.z) > feet.y + 2
+
+
+## A cell with floor under it and headroom above, on the surface or in a cave.
+func _spawn_spot(x: int, z: int, underground: bool) -> Vector3i:
+	if not underground:
+		var top := world.column_top(x, z)
+		if top < 4 or top >= VoxelWorld.WH - 3:
+			return Vector3i(x, -1, z)
+		if world.is_solid_at(x, top + 1, z) or world.is_solid_at(x, top + 2, z):
+			return Vector3i(x, -1, z)
+		return Vector3i(x, top + 1, z)
+	var floor_y := player.feet_block().y
+	for dy: int in [0, -2, 2, -4, 4, -6, 6]:
+		var y := floor_y + dy
+		if y < 2 or y >= VoxelWorld.WH - 2:
+			continue
+		if not world.is_solid_at(x, y - 1, z):
+			continue
+		if world.is_solid_at(x, y, z) or world.is_solid_at(x, y + 1, z):
+			continue
+		return Vector3i(x, y, z)
+	return Vector3i(x, -1, z)
 
 
 func spawn_monster(id: StringName, at: Vector3, threat := 1.0) -> Monster:
@@ -1091,7 +1201,7 @@ func _populate_ruin(spec: Dictionary) -> void:
 		for i in _rng.randi_range(2, 4):
 			chest.store(_ruin_loot())
 	# and something guarding it
-	spawn_monster(&"chest_mimic" if _rng.randf() < 0.35 else &"bone_stalker",
+	spawn_monster(&"scandroid" if _rng.randf() < 0.5 else &"ixoling",
 		Vector3(at) + Vector3(2.0, 0.4, 0.0), 1.2)
 
 
@@ -1320,6 +1430,7 @@ func save_game() -> void:
 		"tech": tech.save_state(),
 		"universe": universe.save_state(),
 		"sky": sky.save_state(),
+		"cutaway": world.cutaway.save_state(),
 		"liquids": liquids.save_state(),
 		"recipes": known_recipes.keys(),
 		"objects": objs,
@@ -1354,6 +1465,8 @@ func load_game() -> bool:
 	quests.load_state(data.get("quests", {}))
 	tech.load_state(data.get("tech", {}))
 	sky.load_state(data.get("sky", {}))
+	world.cutaway.load_state(data.get("cutaway", {}))
+	world.set_cutaway_mode(world.cutaway.mode)
 	liquids.load_state(data.get("liquids", {}))
 
 	var planet_id := String(data.get("planet", current_planet_id))
@@ -1459,5 +1572,8 @@ func _setup_input() -> void:
 	_bind(&"quick_save", [_key(KEY_F5)])
 	_bind(&"toggle_help", [_key(KEY_F1)])
 	_bind(&"toggle_cutaway", [_key(KEY_V)])
+	_bind(&"cutaway_mode", [_key(KEY_B)])
+	_bind(&"cutaway_opacity", [_key(KEY_N)])
+	_bind(&"cutaway_select", [_key(KEY_H)])
 	_bind(&"respawn", [_key(KEY_ENTER)])
 	_bind(&"cancel", [_key(KEY_ESCAPE)])

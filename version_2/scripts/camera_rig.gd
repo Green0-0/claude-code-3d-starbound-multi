@@ -89,10 +89,59 @@ func _process(delta: float) -> void:
 	# --- follow
 	if target != null:
 		var want := target.global_position + Vector3(0, height_offset, 0)
-		if global_position.distance_to(want) > 24.0:
+		var dist := global_position.distance_to(want)
+		
+		if dist > 24.0:
 			global_position = want
 		else:
-			global_position = global_position.lerp(want, 1.0 - exp(-follow_smoothing * delta))
+			# Get the camera rig's local horizontal axes. 
+			# Since pitch is applied on a child node, this node's basis is purely yaw (flat on the ground).
+			var right_dir := global_transform.basis.x
+			var fwd_dir := global_transform.basis.z # Points backwards, away from the target
+			
+			# Project current and target positions onto local axes to get screen-space X and Y (depth)
+			var cur_side := global_position.dot(right_dir)
+			var cur_depth := global_position.dot(fwd_dir)
+			var tgt_side := want.dot(right_dir)
+			var tgt_depth := want.dot(fwd_dir)
+			
+			var side_dist := absf(tgt_side - cur_side)
+			var depth_dist := absf(tgt_depth - cur_depth)
+			
+			# --- 1. SIDEWAYS (Local X - Left/Right on screen): Very Fast ---
+			# Using your original curve but with higher multipliers
+			var side_factor := clampf((side_dist / 9.0) * side_dist / 24.0, 0.0, 1.0)
+			var side_base := follow_smoothing * 1.5  # Faster base speed
+			var side_max := follow_smoothing * 5.0   # Much faster max speed
+			var side_smoothing := lerpf(side_base, side_max, side_factor * 5.0)
+			var side_alpha := 1.0 - exp(-side_smoothing * delta / 30.0)
+			
+			# --- 2. DEPTH (Local Z - Holding S / moving toward camera): Almost none until high distances ---
+			# Normalize depth distance, then apply an exponent to delay the curve heavily
+			var depth_factor := clampf(depth_dist / 24.0, 0.0, 1.0)
+			# Cubic curve: stays near 0 until distance gets significantly high
+			depth_factor = pow(depth_factor, 3.0) 
+			
+			var depth_base := follow_smoothing * 0.0 # Effectively zero tracking when close
+			var depth_max := follow_smoothing * 1.5  # Ramps up to moderate speed when far
+			var depth_smoothing := lerpf(depth_base, depth_max, depth_factor)
+			var depth_alpha := 1.0 - exp(-depth_smoothing * delta / 30.0)
+			
+			# --- 3. VERTICAL (Global Y - Up/Down height): Preserving your original logic ---
+			# Uses overall distance so vertical height tracking behaves exactly as it did before
+			var y_factor := clampf((dist / 9.0) * dist / 24.0, 0.0, 1.0)
+			var y_base := follow_smoothing * 0.5
+			var y_max := follow_smoothing * 3.0
+			var y_smoothing := lerpf(y_base, y_max, y_factor * 5.0)
+			var y_alpha := 1.0 - exp(-y_smoothing * delta / 30.0)
+			
+			# Apply independent lerping
+			var new_side := lerpf(cur_side, tgt_side, side_alpha)
+			var new_depth := lerpf(cur_depth, tgt_depth, depth_alpha)
+			var new_y := lerpf(global_position.y, want.y, y_alpha)
+			
+			# Reconstruct the new global position
+			global_position = right_dir * new_side + fwd_dir * new_depth + Vector3(0, new_y, 0)
 
 	# --- turn
 	if _turn_t < 1.0:
@@ -110,7 +159,6 @@ func _process(delta: float) -> void:
 	distance = lerpf(distance, _target_distance, 1.0 - exp(-9.0 * delta))
 	camera.position = Vector3(0, 0, distance)
 	pitch_node.rotation.x = -deg_to_rad(pitch_degrees)
-
 
 static func _ease_in_out(t: float) -> float:
 	return t * t * (3.0 - 2.0 * t)

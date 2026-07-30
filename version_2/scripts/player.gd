@@ -16,6 +16,10 @@ signal died()
 signal interacted(target: Node)
 
 const HALF := Vector3(0.32, 0.9, 0.32)   ## half extents; origin sits at the feet
+## Crouched, the box is short enough to fit a one-block gap and the sprite
+## folds down to match.
+const CROUCH_HALF := Vector3(0.32, 0.47, 0.32)
+const CROUCH_SPEED := 2.7
 const EYE := 1.45
 const GRAVITY := 30.0
 const JUMP_SPEED := 10.6
@@ -62,7 +66,13 @@ var swing_timer := 0.0
 var in_liquid := false
 var submerged := false
 var on_ladder := false
+var crouching := false
 var liquid_block := Blocks.AIR
+
+## The live half-extents. Everything in the physics reads this rather than the
+## constant, so crouching genuinely changes the shape the world is swept
+## against instead of only changing the picture.
+var half := HALF
 
 var _coyote := 0.0
 var _buffer := 0.0
@@ -74,6 +84,7 @@ var _alive := true
 var _hazard_tick := 0.0
 var _floor_friction := 1.0
 var _swing_flash := 0.0
+var _crouch_lerp := 0.0
 
 @onready var sprite: Sprite3D = $Sprite
 @onready var lantern: OmniLight3D = $Lantern
@@ -143,8 +154,9 @@ func _physics_process(delta: float) -> void:
 func _sample_environment() -> void:
 	var feet := feet_block()
 	var mid := Vector3i(int(floor(global_position.x)),
-		int(floor(global_position.y + 0.9)), int(floor(global_position.z)))
-	var head := Vector3i(mid.x, int(floor(global_position.y + 1.5)), mid.z)
+		int(floor(global_position.y + half.y)), int(floor(global_position.z)))
+	var head := Vector3i(mid.x,
+		int(floor(global_position.y + half.y * 2.0 - 0.3)), mid.z)
 
 	var b_mid := world.get_block(mid.x, mid.y, mid.z)
 	var b_feet := world.get_block(feet.x, feet.y, feet.z)
@@ -171,9 +183,14 @@ func _gather_input(delta: float) -> void:
 		var right := Vector3(rig.lateral())
 		wish = (right * ix + fwd * iz).normalized()
 
-	var can_sprint: bool = energy > 1.0 and wish != Vector3.ZERO and not in_liquid
+	_update_crouch()
+
+	var can_sprint: bool = energy > 1.0 and wish != Vector3.ZERO and not in_liquid \
+		and not crouching
 	var sprinting := Input.is_action_pressed(&"sprint") and can_sprint
 	var speed := RUN_SPEED if sprinting else WALK_SPEED
+	if crouching:
+		speed = CROUCH_SPEED
 	speed *= 1.0 + inventory.bonus("move_speed")
 	if stats != null:
 		speed *= stats.move_multiplier()
@@ -234,6 +251,28 @@ func _gather_input(delta: float) -> void:
 			_buffer = 0.0
 
 
+## Crouch while the key is held and there is somewhere to crouch; keep
+## crouching afterwards if standing up would put your head in a block.
+func _update_crouch() -> void:
+	var want: bool = Input.is_action_pressed(&"crouch") and on_floor \
+		and not on_ladder and not in_liquid
+	if crouching and not want and not _can_stand():
+		want = true
+	crouching = want
+	half = CROUCH_HALF if crouching else HALF
+
+
+## Only the band of space that standing up would newly occupy matters. Testing
+## the whole standing box instead would sample the floor the feet are resting
+## on, and a player standing a hair below the integer would never get up again.
+func _can_stand() -> bool:
+	var lo := CROUCH_HALF.y * 2.0
+	var hi := HALF.y * 2.0
+	var mid := (lo + hi) * 0.5
+	return not world.box_overlaps(global_position + Vector3(0, mid, 0),
+		Vector3(HALF.x, (hi - lo) * 0.5, HALF.z))
+
+
 func _integrate(delta: float) -> void:
 	var g := SWIM_GRAVITY if in_liquid else GRAVITY
 	if on_ladder:
@@ -272,7 +311,7 @@ func _integrate(delta: float) -> void:
 
 
 func _overlaps(at: Vector3) -> bool:
-	return world.box_overlaps(at + Vector3(0, HALF.y, 0), HALF)
+	return world.box_overlaps(at + Vector3(0, half.y, 0), half)
 
 
 func _move_axis(amount: float, axis: int) -> void:
@@ -281,6 +320,10 @@ func _move_axis(amount: float, axis: int) -> void:
 	var p := global_position
 	var before := p
 	p[axis] += amount
+	# Sneaking never walks you off an edge, which is the whole reason to sneak
+	# while building out over a drop.
+	if axis != 1 and crouching and on_floor and not _ground_under(p):
+		return
 	global_position = p
 	if not _overlaps(p):
 		return
@@ -323,10 +366,23 @@ func _move_axis(amount: float, axis: int) -> void:
 		velocity[axis] = 0.0
 
 
+## Is there anything to stand on beneath the box at this position?
+func _ground_under(at: Vector3) -> bool:
+	for dx in [-half.x, half.x]:
+		for dz in [-half.z, half.z]:
+			var c := at + Vector3(dx, -0.06, dz)
+			if world.is_solid_at(int(floor(c.x)), int(floor(c.y)), int(floor(c.z))):
+				return true
+	return false
+
+
 func _animate(delta: float) -> void:
 	var planar := Vector2(velocity.x, velocity.z).length()
 	if not on_floor:
 		sprite.frame = 5
+	elif crouching and planar <= 0.4:
+		_anim = 0.0
+		sprite.frame = 0
 	elif planar > 0.4:
 		_anim += delta * (3.0 + planar * 1.1)
 		sprite.frame = 1 + (int(_anim) % 4)
@@ -335,10 +391,14 @@ func _animate(delta: float) -> void:
 		sprite.frame = 0
 	sprite.flip_h = facing_sign < 0.0
 
-	# a little squash on landing / stretch in the air, Paper-Mario style
+	# a little squash on landing / stretch in the air, Paper-Mario style, and a
+	# deeper fold when crouching so the pose reads at a glance
+	_crouch_lerp = lerpf(_crouch_lerp, 1.0 if crouching else 0.0,
+		1.0 - exp(-16.0 * delta))
 	var target_scale := Vector3.ONE
 	if not on_floor:
 		target_scale = Vector3(0.94, 1.07, 1.0)
+	target_scale = target_scale.lerp(Vector3(1.14, 0.55, 1.0), _crouch_lerp)
 	sprite.scale = sprite.scale.lerp(target_scale, 1.0 - exp(-14.0 * delta))
 
 	# keep the lantern between the lens and the sprite, so a Y-billboard is lit
@@ -352,7 +412,7 @@ func _animate(delta: float) -> void:
 	# smooth out auto-step so the camera does not jolt
 	if _step_lerp > 0.0:
 		_step_lerp = maxf(_step_lerp - delta * 7.0, 0.0)
-	sprite.position.y = 0.95 - _step_lerp * 0.35
+	sprite.position.y = 0.95 - _step_lerp * 0.35 - _crouch_lerp * 0.42
 
 	# hurt/swing tint
 	if _swing_flash > 0.0:
@@ -367,13 +427,13 @@ func _apply_hazards(delta: float) -> void:
 	if _hazard_tick > 0.0:
 		return
 	_hazard_tick = 0.25
-	var centre := global_position + Vector3(0, HALF.y, 0)
+	var centre := global_position + Vector3(0, half.y, 0)
 	var worst := 0.0
 	var element: StringName = Blocks.ELEM_PHYSICAL
 	var healing := 0.0
-	for x in range(int(floor(centre.x - HALF.x)), int(floor(centre.x + HALF.x)) + 1):
-		for y in range(int(floor(centre.y - HALF.y)), int(floor(centre.y + HALF.y)) + 1):
-			for z in range(int(floor(centre.z - HALF.z)), int(floor(centre.z + HALF.z)) + 1):
+	for x in range(int(floor(centre.x - half.x)), int(floor(centre.x + half.x)) + 1):
+		for y in range(int(floor(centre.y - half.y)), int(floor(centre.y + half.y)) + 1):
+			for z in range(int(floor(centre.z - half.z)), int(floor(centre.z + half.z)) + 1):
 				var id := world.get_block(x, y, z)
 				if id == Blocks.AIR:
 					continue
@@ -567,10 +627,10 @@ func _placement_is_clear(cell: Vector3i) -> bool:
 		return false
 	# never brick yourself in
 	var centre := Vector3(cell) + Vector3(0.5, 0.5, 0.5)
-	var mine := global_position + Vector3(0, HALF.y, 0)
-	if absf(centre.x - mine.x) < HALF.x + 0.5 \
-			and absf(centre.y - mine.y) < HALF.y + 0.5 \
-			and absf(centre.z - mine.z) < HALF.z + 0.5:
+	var mine := global_position + Vector3(0, half.y, 0)
+	if absf(centre.x - mine.x) < half.x + 0.5 \
+			and absf(centre.y - mine.y) < half.y + 0.5 \
+			and absf(centre.z - mine.z) < half.z + 0.5:
 		return false
 	if game != null and game.entity_occupies(cell):
 		return false
@@ -694,6 +754,24 @@ func spawn_point() -> Vector3:
 
 func is_alive() -> bool:
 	return _alive
+
+
+## How far away a creature can hear you. Sprinting carries, walking is ordinary,
+## and crouching is close to silent — which is what makes sneaking a tactic
+## rather than a pose.
+func noise_radius() -> float:
+	var speed := Vector2(velocity.x, velocity.z).length()
+	if crouching:
+		return 3.0 + speed * 0.6
+	if speed > RUN_SPEED * 0.8:
+		return 26.0
+	if speed > 0.6:
+		return 15.0
+	return 7.0
+
+
+func is_sneaking() -> bool:
+	return crouching
 
 
 ## Block the player's feet occupy — the anchor for the whole cutaway system.

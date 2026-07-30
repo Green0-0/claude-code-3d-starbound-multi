@@ -1,4 +1,4 @@
-[gd_scene load_steps=18 format=3 uid="uid://br1pikvauk7my"]
+[gd_scene format=3 uid="uid://br1pikvauk7my"]
 
 [ext_resource type="Script" uid="uid://bsroq6rbyvyck" path="res://scripts/game.gd" id="1_game"]
 [ext_resource type="Script" uid="uid://dgymi5b42otab" path="res://scripts/voxel_world.gd" id="2_world"]
@@ -47,7 +47,6 @@ glow_levels/5 = 0.5
 glow_levels/6 = 0.25
 glow_intensity = 0.7
 glow_bloom = 0.08
-glow_blend_mode = 1
 glow_hdr_threshold = 1.15
 glow_hdr_luminance_cap = 10.0
 fog_enabled = true
@@ -146,13 +145,13 @@ corner_radius_top_right = 3
 corner_radius_bottom_right = 3
 corner_radius_bottom_left = 3
 
-[node name="Game" type="Node3D"]
+[node name="Game" type="Node3D" unique_id=690451967]
 script = ExtResource("1_game")
 
-[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1320122212]
 environment = SubResource("Env_1")
 
-[node name="Sun" type="DirectionalLight3D" parent="."]
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=1288172513]
 transform = Transform3D(0.766044, -0.383022, 0.51503, 0, 0.803857, 0.594823, -0.642788, -0.455651, 0.612692, 0, 40, 0)
 light_color = Color(1, 0.827451, 0.639216, 1)
 light_energy = 2.05
@@ -170,27 +169,27 @@ directional_shadow_fade_start = 0.9
 directional_shadow_max_distance = 130.0
 directional_shadow_pancake_size = 40.0
 
-[node name="Bounce" type="DirectionalLight3D" parent="."]
+[node name="Bounce" type="DirectionalLight3D" parent="." unique_id=700202568]
 transform = Transform3D(-0.642788, 0.28601, -0.710595, 0, 0.927184, 0.374607, 0.766044, 0.24393, -0.60402, 0, 30, 0)
 light_color = Color(0.352941, 0.443137, 0.780392, 1)
 light_energy = 0.42
 light_specular = 0.15
 
-[node name="World" type="Node3D" parent="."]
+[node name="World" type="Node3D" parent="." unique_id=19105574]
 script = ExtResource("2_world")
 
-[node name="Player" type="Node3D" parent="."]
+[node name="Player" type="Node3D" parent="." unique_id=537736298]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 30, 0)
 script = ExtResource("3_player")
 
-[node name="Sprite" type="Sprite3D" parent="Player"]
+[node name="Sprite" type="Sprite3D" parent="Player" unique_id=915128843]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.95, 0)
 billboard = 2
 shaded = true
 alpha_cut = 1
 texture_filter = 0
 
-[node name="Lantern" type="OmniLight3D" parent="Player"]
+[node name="Lantern" type="OmniLight3D" parent="Player" unique_id=930318649]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.35, 1.15, 0)
 light_color = Color(1, 0.694118, 0.376471, 1)
 light_energy = 4.2
@@ -201,18 +200,18 @@ shadow_bias = 0.04
 omni_range = 19.0
 omni_attenuation = 1.6
 
-[node name="Critters" type="Node3D" parent="."]
+[node name="Critters" type="Node3D" parent="." unique_id=224582809]
 
-[node name="Highlight" type="MeshInstance3D" parent="."]
+[node name="Highlight" type="MeshInstance3D" parent="." unique_id=905404357]
 cast_shadow = 0
 
-[node name="CameraRig" type="Node3D" parent="."]
+[node name="CameraRig" type="Node3D" parent="." unique_id=848700355]
 script = ExtResource("4_rig")
 
-[node name="Pitch" type="Node3D" parent="CameraRig"]
+[node name="Pitch" type="Node3D" parent="CameraRig" unique_id=980797610]
 transform = Transform3D(1, 0, 0, 0, 0.866025, 0.5, 0, -0.5, 0.866025, 0, 0, 0)
 
-[node name="Camera3D" type="Camera3D" parent="CameraRig/Pitch"]
+[node name="Camera3D" type="Camera3D" parent="CameraRig/Pitch" unique_id=133584451]
 transform = Transform3D(1, 0, 0, 0, 0.8191525, -0.57357675, 0, 0.57357675, 0.8191525, 0, 0, 0)
 attributes = SubResource("Cam_1")
 current = true
@@ -220,10 +219,10 @@ fov = 33.0
 near = 0.2
 far = 320.0
 
-[node name="Post" type="CanvasLayer" parent="."]
+[node name="Post" type="CanvasLayer" parent="." unique_id=780210902]
 layer = 2
 
-[node name="Grade" type="ColorRect" parent="Post"]
+[node name="Grade" type="ColorRect" parent="Post" unique_id=1222966380]
 material = SubResource("Post_1")
 anchors_preset = 15
 anchor_right = 1.0
@@ -232,11 +231,11 @@ grow_horizontal = 2
 grow_vertical = 2
 mouse_filter = 2
 
-[node name="HUD" type="CanvasLayer" parent="."]
+[node name="HUD" type="CanvasLayer" parent="." unique_id=1216964883]
 layer = 3
 script = ExtResource("5_hud")
 
-[node name="Root" type="Control" parent="HUD"]
+[node name="Root" type="Control" parent="HUD" unique_id=1685615578]
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0
@@ -245,7 +244,7 @@ grow_horizontal = 2
 grow_vertical = 2
 mouse_filter = 2
 
-[node name="Vitals" type="VBoxContainer" parent="HUD/Root"]
+[node name="Vitals" type="VBoxContainer" parent="HUD/Root" unique_id=1591321402]
 layout_mode = 0
 offset_left = 22.0
 offset_top = 20.0
@@ -254,12 +253,12 @@ offset_bottom = 96.0
 mouse_filter = 2
 theme_override_constants/separation = 6
 
-[node name="HealthRow" type="HBoxContainer" parent="HUD/Root/Vitals"]
+[node name="HealthRow" type="HBoxContainer" parent="HUD/Root/Vitals" unique_id=481312728]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/separation = 8
 
-[node name="HealthTag" type="Label" parent="HUD/Root/Vitals/HealthRow"]
+[node name="HealthTag" type="Label" parent="HUD/Root/Vitals/HealthRow" unique_id=715146168]
 custom_minimum_size = Vector2(26, 0)
 layout_mode = 2
 theme_override_colors/font_color = Color(0.898039, 0.482353, 0.443137, 1)
@@ -268,7 +267,7 @@ theme_override_constants/outline_size = 5
 theme_override_font_sizes/font_size = 14
 text = "HP"
 
-[node name="HealthBar" type="ProgressBar" parent="HUD/Root/Vitals/HealthRow"]
+[node name="HealthBar" type="ProgressBar" parent="HUD/Root/Vitals/HealthRow" unique_id=748953498]
 custom_minimum_size = Vector2(236, 18)
 layout_mode = 2
 theme_override_styles/background = SubResource("BarBG")
@@ -276,12 +275,12 @@ theme_override_styles/fill = SubResource("BarHP")
 value = 100.0
 show_percentage = false
 
-[node name="EnergyRow" type="HBoxContainer" parent="HUD/Root/Vitals"]
+[node name="EnergyRow" type="HBoxContainer" parent="HUD/Root/Vitals" unique_id=1088271225]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/separation = 8
 
-[node name="EnergyTag" type="Label" parent="HUD/Root/Vitals/EnergyRow"]
+[node name="EnergyTag" type="Label" parent="HUD/Root/Vitals/EnergyRow" unique_id=27199787]
 custom_minimum_size = Vector2(26, 0)
 layout_mode = 2
 theme_override_colors/font_color = Color(0.968627, 0.780392, 0.396078, 1)
@@ -290,7 +289,7 @@ theme_override_constants/outline_size = 5
 theme_override_font_sizes/font_size = 14
 text = "EN"
 
-[node name="EnergyBar" type="ProgressBar" parent="HUD/Root/Vitals/EnergyRow"]
+[node name="EnergyBar" type="ProgressBar" parent="HUD/Root/Vitals/EnergyRow" unique_id=1537882383]
 custom_minimum_size = Vector2(236, 14)
 layout_mode = 2
 theme_override_styles/background = SubResource("BarBG")
@@ -298,7 +297,7 @@ theme_override_styles/fill = SubResource("BarEN")
 value = 100.0
 show_percentage = false
 
-[node name="CompassPanel" type="PanelContainer" parent="HUD/Root"]
+[node name="CompassPanel" type="PanelContainer" parent="HUD/Root" unique_id=1072406888]
 layout_mode = 0
 anchor_left = 1.0
 anchor_right = 1.0
@@ -310,7 +309,7 @@ grow_horizontal = 0
 mouse_filter = 2
 theme_override_styles/panel = SubResource("Panel_2")
 
-[node name="Margin" type="MarginContainer" parent="HUD/Root/CompassPanel"]
+[node name="Margin" type="MarginContainer" parent="HUD/Root/CompassPanel" unique_id=1467176003]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/margin_left = 10
@@ -318,7 +317,7 @@ theme_override_constants/margin_top = 4
 theme_override_constants/margin_right = 10
 theme_override_constants/margin_bottom = 4
 
-[node name="Compass" type="Label" parent="HUD/Root/CompassPanel/Margin"]
+[node name="Compass" type="Label" parent="HUD/Root/CompassPanel/Margin" unique_id=1073437944]
 layout_mode = 2
 theme_override_colors/font_color = Color(1, 0.815686, 0.545098, 1)
 theme_override_colors/font_outline_color = Color(0, 0, 0, 0.784314)
@@ -327,7 +326,7 @@ theme_override_font_sizes/font_size = 17
 text = "NORTH"
 horizontal_alignment = 1
 
-[node name="InfoPanel" type="PanelContainer" parent="HUD/Root"]
+[node name="InfoPanel" type="PanelContainer" parent="HUD/Root" unique_id=328420634]
 layout_mode = 0
 anchor_left = 1.0
 anchor_right = 1.0
@@ -339,7 +338,7 @@ grow_horizontal = 0
 mouse_filter = 2
 theme_override_styles/panel = SubResource("Panel_1")
 
-[node name="Margin" type="MarginContainer" parent="HUD/Root/InfoPanel"]
+[node name="Margin" type="MarginContainer" parent="HUD/Root/InfoPanel" unique_id=1837856575]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/margin_left = 10
@@ -347,14 +346,14 @@ theme_override_constants/margin_top = 6
 theme_override_constants/margin_right = 10
 theme_override_constants/margin_bottom = 6
 
-[node name="Info" type="Label" parent="HUD/Root/InfoPanel/Margin"]
+[node name="Info" type="Label" parent="HUD/Root/InfoPanel/Margin" unique_id=475760599]
 layout_mode = 2
 theme_override_colors/font_color = Color(0.741176, 0.717647, 0.717647, 1)
 theme_override_font_sizes/font_size = 12
 text = "..."
 horizontal_alignment = 2
 
-[node name="HotbarPanel" type="PanelContainer" parent="HUD/Root"]
+[node name="HotbarPanel" type="PanelContainer" parent="HUD/Root" unique_id=1181544265]
 layout_mode = 0
 anchor_left = 0.5
 anchor_top = 1.0
@@ -369,7 +368,7 @@ grow_vertical = 0
 mouse_filter = 2
 theme_override_styles/panel = SubResource("Panel_1")
 
-[node name="Margin" type="MarginContainer" parent="HUD/Root/HotbarPanel"]
+[node name="Margin" type="MarginContainer" parent="HUD/Root/HotbarPanel" unique_id=12573840]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/margin_left = 7
@@ -377,13 +376,13 @@ theme_override_constants/margin_top = 7
 theme_override_constants/margin_right = 7
 theme_override_constants/margin_bottom = 7
 
-[node name="Hotbar" type="HBoxContainer" parent="HUD/Root/HotbarPanel/Margin"]
+[node name="Hotbar" type="HBoxContainer" parent="HUD/Root/HotbarPanel/Margin" unique_id=1377422291]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/separation = 6
 alignment = 1
 
-[node name="ItemName" type="Label" parent="HUD/Root"]
+[node name="ItemName" type="Label" parent="HUD/Root" unique_id=2644406]
 layout_mode = 0
 anchor_left = 0.5
 anchor_top = 1.0
@@ -401,7 +400,7 @@ theme_override_constants/outline_size = 6
 theme_override_font_sizes/font_size = 18
 horizontal_alignment = 1
 
-[node name="HelpPanel" type="PanelContainer" parent="HUD/Root"]
+[node name="HelpPanel" type="PanelContainer" parent="HUD/Root" unique_id=1515278570]
 layout_mode = 0
 anchor_top = 0.5
 anchor_bottom = 0.5
@@ -413,7 +412,7 @@ grow_vertical = 2
 mouse_filter = 2
 theme_override_styles/panel = SubResource("Panel_2")
 
-[node name="Margin" type="MarginContainer" parent="HUD/Root/HelpPanel"]
+[node name="Margin" type="MarginContainer" parent="HUD/Root/HelpPanel" unique_id=133161814]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/margin_left = 16
@@ -421,7 +420,7 @@ theme_override_constants/margin_top = 14
 theme_override_constants/margin_right = 16
 theme_override_constants/margin_bottom = 14
 
-[node name="Text" type="Label" parent="HUD/Root/HelpPanel/Margin"]
+[node name="Text" type="Label" parent="HUD/Root/HelpPanel/Margin" unique_id=1297110758]
 layout_mode = 2
 theme_override_colors/font_color = Color(0.858824, 0.827451, 0.788235, 1)
 theme_override_colors/font_outline_color = Color(0, 0, 0, 0.784314)
@@ -454,7 +453,7 @@ exposed cross-section is rebuilt as
 real geometry. Dig in, or walk into a
 house, and watch."
 
-[node name="LoadingPanel" type="PanelContainer" parent="HUD/Root"]
+[node name="LoadingPanel" type="PanelContainer" parent="HUD/Root" unique_id=435311846]
 layout_mode = 0
 anchor_left = 0.5
 anchor_top = 0.5
@@ -469,7 +468,7 @@ grow_vertical = 2
 mouse_filter = 2
 theme_override_styles/panel = SubResource("Panel_2")
 
-[node name="Margin" type="MarginContainer" parent="HUD/Root/LoadingPanel"]
+[node name="Margin" type="MarginContainer" parent="HUD/Root/LoadingPanel" unique_id=1207867796]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/margin_left = 24
@@ -477,33 +476,33 @@ theme_override_constants/margin_top = 20
 theme_override_constants/margin_right = 24
 theme_override_constants/margin_bottom = 20
 
-[node name="VBox" type="VBoxContainer" parent="HUD/Root/LoadingPanel/Margin"]
+[node name="VBox" type="VBoxContainer" parent="HUD/Root/LoadingPanel/Margin" unique_id=1704585410]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/separation = 12
 
-[node name="Title" type="Label" parent="HUD/Root/LoadingPanel/Margin/VBox"]
+[node name="Title" type="Label" parent="HUD/Root/LoadingPanel/Margin/VBox" unique_id=500524171]
 layout_mode = 2
 theme_override_colors/font_color = Color(1, 0.807843, 0.529412, 1)
 theme_override_font_sizes/font_size = 26
 text = "V O X E L B O U N D"
 horizontal_alignment = 1
 
-[node name="Status" type="Label" parent="HUD/Root/LoadingPanel/Margin/VBox"]
+[node name="Status" type="Label" parent="HUD/Root/LoadingPanel/Margin/VBox" unique_id=352784225]
 layout_mode = 2
 theme_override_colors/font_color = Color(0.780392, 0.752941, 0.729412, 1)
 theme_override_font_sizes/font_size = 14
 text = "Terraforming"
 horizontal_alignment = 1
 
-[node name="Bar" type="ProgressBar" parent="HUD/Root/LoadingPanel/Margin/VBox"]
+[node name="Bar" type="ProgressBar" parent="HUD/Root/LoadingPanel/Margin/VBox" unique_id=586829764]
 custom_minimum_size = Vector2(0, 14)
 layout_mode = 2
 theme_override_styles/background = SubResource("BarBG")
 theme_override_styles/fill = SubResource("BarLoad")
 show_percentage = false
 
-[node name="DeathPanel" type="PanelContainer" parent="HUD/Root"]
+[node name="DeathPanel" type="PanelContainer" parent="HUD/Root" unique_id=639721345]
 layout_mode = 0
 anchor_left = 0.5
 anchor_top = 0.5
@@ -518,7 +517,7 @@ grow_vertical = 2
 mouse_filter = 2
 theme_override_styles/panel = SubResource("Panel_2")
 
-[node name="Margin" type="MarginContainer" parent="HUD/Root/DeathPanel"]
+[node name="Margin" type="MarginContainer" parent="HUD/Root/DeathPanel" unique_id=1067464122]
 layout_mode = 2
 mouse_filter = 2
 theme_override_constants/margin_left = 24
@@ -526,7 +525,7 @@ theme_override_constants/margin_top = 20
 theme_override_constants/margin_right = 24
 theme_override_constants/margin_bottom = 20
 
-[node name="Text" type="Label" parent="HUD/Root/DeathPanel/Margin"]
+[node name="Text" type="Label" parent="HUD/Root/DeathPanel/Margin" unique_id=1080336285]
 layout_mode = 2
 theme_override_colors/font_color = Color(0.960784, 0.607843, 0.556863, 1)
 theme_override_font_sizes/font_size = 20

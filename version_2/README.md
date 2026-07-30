@@ -11,11 +11,14 @@ every texture, icon, character, villager and monster is synthesised at boot.
 ```
 WASD      move (relative to the camera)      LMB   mine (hold)
 Space     jump — auto-steps single blocks    RMB   place / use the held item
-Shift     sprint (burns energy)              F     swing at what you are aiming at
-Ctrl      crouch · climb down ladders        R     interact (talk, open, sit)
+Shift     sprint (loud)                      F     swing at what you are aiming at
+Ctrl      crouch — quiet, short, sure-footed R     interact · talk · offer food
 Q / E     rotate the world 90°               G     activate the equipped tech
 Wheel     zoom · Ctrl+Wheel change slot      X     drop the held stack
-1-9       hotbar slot                        V     toggle the cutaway system
+1-9       hotbar slot
+
+CUTAWAY   V on/off   B mode (drill / fill / planar)   N ghost opacity
+          H mine through the cut
 
 I / Tab   inventory     K crafting     J quests     M star map     T techs
 F5        quick save    F1 help        Esc close panel / quit
@@ -30,18 +33,50 @@ evaluated identically on the CPU and the GPU. There is no special case for
 tunnels, none for house interiors, none for overhangs — those are all the same
 situation as far as the rule is concerned.
 
-The system casts a cylindrical "drill" from the camera lens to the player: any
-block intersecting that cylinder is cut. The volume is a cylinder of `radius`
-around the camera→player segment, plus a spherical cap of `target_padding` at
-the player end so your immediate surroundings stay visible even when you are
-pressed against a wall.
+Two rules come before anything else.
 
-That handles the awkward cases for free. Fall down a hole and the cylinder
-punches straight through the roof above you, exposing the shaft all the way
-down without gouging out the rest of the hillside. Walk into a house and the
-front wall and the near half of the roof happen to lie on the line of sight, so
-you see the interior — nothing knows it is a house. Turn the camera and the
-whole thing re-resolves along the new axis.
+**The keep shell.** Blocks immediately around the player are never cut *unless
+they lie toward the lens*. The floor under your feet, the wall beside you and
+the tree you just walked up to all stay exactly where they are. This is not a
+nicety: without it the thing you are trying to mine vanishes at precisely the
+moment you get close enough to mine it, and the opening quest — fell six logs —
+is unfinishable. The test suite asserts it in both directions: a trunk beside
+you survives and is still aimable, and a block genuinely between you and the
+lens is still removed.
+
+**Then one of three shapes**, cycled with `B`:
+
+| mode | what it removes |
+|---|---|
+| **Drill** | a cylinder from the lens to the player, with a spherical cap at your end so you stay visible pressed against a wall |
+| **Fill** | cast to the first air along the sightline, flood-fill the pocket you are standing in, and cut everything between *that whole pocket* and the lens |
+| **Planar** | when you are genuinely occluded, a slab of voxel coordinates directly in front of you: the flat side-on cross-section |
+
+Drill handles the awkward cases for free — fall down a hole and it punches
+straight through the roof, exposing the shaft without gouging the hillside.
+
+Fill is the one for tunnels. A drill shows you a cone around yourself; fill
+shows you the *gallery*, lanterns receding into the distance and all. The flood
+only travels through **covered** air, which is what confines it: a doorway does
+not leak it into the open sky, so it works indoors as well as underground, and
+standing in a field it does nothing at all.
+
+Planar is the classic Starbound slab, and it stays dormant until something is
+actually in the way.
+
+### Ghosts instead of holes
+
+Cut blocks are deleted outright by default. Press `N` and they become dithered
+ghosts instead, at an opacity that **fades to nothing with distance from you**,
+the way distant props fade in Don't Starve — desaturated and cooled so they read
+as a blueprint of the block rather than the block. The dither is an ordered
+screen-door pattern in the opaque pass, so there is no sorting and no second
+draw call.
+
+`H` decides whether cut blocks can still be mined. When ghosts are visible they
+are targetable directly; when blocks are deleted the raycast prefers what you
+can see and only falls back to the hidden geometry if there was nothing else, so
+a cutaway can never leave you unable to reach something that is really there.
 
 ### Making it look like a cut, not a hole
 
@@ -73,6 +108,10 @@ action with consequences:
 
 - the **Phase Lance** fires through terrain along the line of sight and hits
   whatever the cutaway is hiding;
+- **crouching** (`Ctrl`) drops your hitbox low enough to crawl a one-block gap,
+  stops you walking off a ledge, and cuts your noise radius from twenty-six
+  metres to three — which is the difference between walking past a Fennix and
+  meeting one;
 - the **Revenant Edge** hits *only* targets standing inside the cut volume — it
   is inert in the open and devastating down a corridor;
 - the **Depth Charge Launcher**'s blast runs back along the lens axis instead of
@@ -96,7 +135,7 @@ quests and leave the planet.
 | **246 blocks** | four depth strata (crust → mantle → deepstone → corestone), 29 ores gated by tool tier, 14 biome palettes, liquids, hazards, ladders, one-way platforms, cross-quad foliage and crops |
 | **662 items** | the copper→solarium metal ladder, tools, weapons, armour sets with set bonuses, food, medicine, seeds, tech cards, placeable objects |
 | **270 recipes** | across eleven stations, mostly *learned by picking up the ingredient* rather than unlocked by a menu |
-| **25 species** | ground, flying, ranged, aquatic and special, plus four bosses, all drawn procedurally from a shape and a feature dictionary |
+| **19 creatures** | Starbound's hand-made unique monsters — no procedural generation, no farm animals — each with its own temperament, hours, diet and social habits |
 | **21 quests** | a ten-beat campaign that teaches the game in order, plus a pool of repeatable side quests the village roles hand out |
 | **37 effects** | buffs, elemental debuffs and the four survival needs, all expressed as the same kind of object |
 | **17 techs** | one per slot across legs / body / head |
@@ -105,6 +144,40 @@ quests and leave the planet.
 Progression is the descent. Ore tiers are banded by depth and gated by tool
 tier, so a copper pickaxe returns *nothing* from a titanium vein — the ladder is
 not a suggestion. Digging deeper is the difficulty curve.
+
+### The bestiary
+
+The creatures are characters rather than stat blocks. Each runs a small state
+machine over three drives — **hunger**, **fear** and **alertness** — and the
+states are `sleep`, `graze`, `wander`, `alert`, `stalk`, `chase`, `attack`,
+`flee` and `return`. A glyph over the head tells you which one you are looking
+at, because knowing that a thing has *decided about you* is the whole game.
+
+Perception is sight **and** hearing. Sight is a cone, blocked by terrain, and
+halved at night for anything diurnal. Hearing reads what you are actually
+doing — sprinting carries twenty-six metres, crouching barely three — so
+sneaking is a tactic rather than a pose.
+
+What that buys, per creature:
+
+- a **Poptop** grazes in loose herds by day and is entirely harmless until you
+  are inside its patch, at which point it leaps;
+- a **Yokat** herd bolts as one animal and only fights when there is nowhere
+  left to run;
+- a **Hypnare** will not start anything ever — hit it once and it retaliates,
+  and whatever it touches goes slow;
+- a **Mandraflora** is indistinguishable from undergrowth until you are close;
+- a **Crustoise** walks up walls and has a shell that must be cracked before
+  damage means anything;
+- a **Batong** is blind, hunts entirely by ear, and does not care how dark it is;
+- a **Scandroid** has a narrow sight cone and an alarm that tells everything
+  within thirty metres exactly where you are;
+- a **Fennix** hunts in threes and will kill an unprepared player;
+- **packs** converge on a wounded member, **herds** scatter, and anything below
+  its courage threshold breaks and runs.
+
+Offer a creature something it eats (`R` while holding it) and, if it is calm
+enough to take it, it will start to come round to you.
 
 ### The Proving Ground
 
@@ -138,10 +211,11 @@ scripts/
   liquids.gd              flow, falling blocks and crop growth on one budget
   sky.gd                  day/night and weather, modulating the authored grade
   voxel_world.gd          storage, streaming, mesher, cutaway caps, raycast
-  cutaway.gd              THE predicate + its shader-global bridge
+  cutaway.gd              THE predicate — three modes, keep shell, ghosting
   camera_rig.gd           quantised 4-way yaw, pitch, follow, zoom
   player.gd               billboard actor, voxel AABB physics, mining/building
-  monster.gd  npc.gd      the other actors, on the same physics
+  monster.gd              drives, senses, states — the creature brain
+  npc.gd                  villagers, on the same physics
   placed_object.gd        chests, stations, machines, doors
   item_drop.gd  projectile.gd
   ui.gd                   every full-screen panel
@@ -152,6 +226,7 @@ scripts/
   content/                the data: blocks, items, recipes, species, quests,
                           crops, techs, objects, effects, NPC roles
 shaders/
+  cutaway.gdshaderinc     the predicate again, in GLSL, included by every pass
   voxel.gdshader          terrain, with the cutaway discard
   voxel_glass.gdshader    transparent pass (glass, ice, water), same discard
   voxel_cross.gdshader    crossed-quad foliage and crops, same discard
@@ -222,13 +297,17 @@ godot --path .              tools/playthrough.tscn # scripted play + screenshots
 ```
 
 `tools/smoke_test.tscn` boots the real `main.tscn`, streams the world in, and
-asserts the things that must hold for the game to be playable: registries filled
-and cross-referentially sound (no recipe, drop or quest reward naming an item
-that does not exist), terrain generated with ore and plants in it, the player
-standing in free space on solid ground, mining dropping and tier-gating
-correctly, placing consuming, crafting resolving, monsters taking damage,
-quests advancing and chaining, the cutaway predicate agreeing with itself, and a
-save round-tripping.
+runs 124 assertions covering everything that has to hold for the game to be
+playable: registries filled and cross-referentially sound (no recipe, drop or
+quest reward naming an item that does not exist), terrain generated with ore and
+plants in it, the player standing in free space on solid ground, mining dropping
+and tier-gating correctly, placing consuming, crafting resolving, monsters
+taking damage, quests advancing and chaining, a save round-tripping — and the
+rules that were added because they had been got wrong once already: the keep
+shell protects the floor and the trunk beside you but not the block in the way,
+the fill never escapes into the open sky, planar stays dormant in the open,
+crouching genuinely changes the swept box, and a shelled creature soaks damage
+until its shell is gone.
 
 `tools/playthrough.tscn` needs a real renderer for the screenshots but runs
 headless for the logic. It exists mainly for the **panels**: they are only built
