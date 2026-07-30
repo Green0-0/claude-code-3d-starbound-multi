@@ -87,8 +87,19 @@ func total_count() -> int:
 	return _mobs.size()
 
 
+## Does this planet permit hostile spawns at all?
+##
+## `Universe` sets `hostiles = false` on the superflat proving ground so it stays
+## a safe place to test building and the perspective mechanic. Absent the key,
+## every world is hostile — this is opt-out, not opt-in.
+func hostiles_allowed() -> bool:
+	return bool(World.planet.get("hostiles", true))
+
+
 ## How many hostiles this planet, biome and hour of day should support.
 func population_cap() -> int:
+	if not hostiles_allowed():
+		return 0
 	var threat := _planet_threat()
 	var cap := 12 + threat * 3
 	if Game.is_night():
@@ -516,7 +527,7 @@ static func _first(d: Dictionary, keys: Array, fallback: Variant) -> Variant:
 
 func _tick_spawners(delta: float) -> void:
 	var player := Game.player
-	if player == null:
+	if player == null or not hostiles_allowed():
 		return
 	for cpos: Vector3i in _spawners:
 		for s: Dictionary in _spawners[cpos]:

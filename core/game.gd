@@ -33,6 +33,10 @@ var stats := {
 
 const ITEM_DROP_SCENE := "res://entities/item_drop.tscn"
 const SPAWN_FINDER := "res://worldgen/spawn_finder.gd"
+
+## Items every new run starts with. The dirt is a testing convenience: enough to
+## exercise building, platforms and the layer shift without having to mine first.
+const STARTING_KIT := {&"dirt": 99}
 var _drop_scene: PackedScene = null
 
 
@@ -177,6 +181,23 @@ func start_new_game(p_seed: int = 0) -> void:
 	Universe.generate(run_seed)
 	var start_id: String = Universe.starting_planet_id()
 	travel_to_planet(start_id)
+	grant_starting_kit()
+
+
+## Hand the player their opening inventory.
+##
+## Safe to call before the inventory node has attached: the player buffers early
+## grants and flushes them once it does.
+func grant_starting_kit() -> void:
+	if player == null:
+		return
+	for item_id: StringName in STARTING_KIT:
+		var count: int = int(STARTING_KIT[item_id])
+		if not Items.has(item_id):
+			push_warning("[Game] starting kit references unknown item '%s'" % item_id)
+			continue
+		if player.has_method(&"give_item"):
+			player.call(&"give_item", item_id, count)
 
 
 func travel_to_planet(planet_id: String) -> void:
@@ -215,6 +236,12 @@ func _place_player_on_surface() -> void:
 		if y < 0:
 			y = Const.WORLD_HEIGHT / 2
 		spot.y = float(y) + 1.2
+	# Whatever chose the spot, trust the *voxels* for the final height. A spawn
+	# even a few blocks high means arriving with fall damage; 30 blocks high
+	# means arriving dead.
+	var real_ground := World.ground_y(floori(spot.x), floori(spot.z))
+	if real_ground >= 0:
+		spot.y = float(real_ground) + 1.2
 	player.teleport(spot)
 	x = floori(spot.x)
 	z = floori(spot.z)

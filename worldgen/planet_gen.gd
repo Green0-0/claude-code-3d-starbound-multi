@@ -132,6 +132,9 @@ func _ensure() -> void:
 ## Fill `chunk`. Deterministic in (seed, chunk position).
 func generate_chunk(chunk: Chunk) -> void:
 	_ensure()
+	if generator == &"superflat":
+		_fill_superflat(chunk)
+		return
 	if generator != &"planet":
 		# `flat` and `void` worlds (the ship, the outpost) are stamped in code by
 		# the space agent — see `space/stamp.gd`. We must leave them empty.
@@ -147,6 +150,52 @@ func generate_chunk(chunk: Chunk) -> void:
 	chunk.recount()
 	_place_structures(chunk)
 	chunk.populated = true
+
+
+## Minecraft-style superflat: bedrock, stone, soil, grass, nothing else.
+##
+## This is the testing world. It is deliberately featureless — no caves, ores,
+## structures, liquids or decoration — so that building, physics, the flip and
+## the layer shift can be exercised against terrain with no confounding
+## variables. `flat_height` is the Y of the grass course.
+func _fill_superflat(chunk: Chunk) -> void:
+	var top: int = clampi(int(meta.get("flat_height", 64)), 4, Const.WORLD_HEIGHT - 2)
+	var o := chunk.origin()
+	# Chunks entirely above the surface stay empty; entirely below, solid stone.
+	if o.y > top:
+		chunk.recount()
+		chunk.populated = true
+		return
+	var id_bedrock := _block_id(&"bedrock", &"stone")
+	var id_stone := _block_id(&"stone", &"cobblestone")
+	var id_soil := _block_id(&"dirt", &"loam")
+	var id_grass := _block_id(&"grass", &"dirt")
+	for ly in Const.CHUNK_SIZE:
+		var y := o.y + ly
+		if y > top:
+			break
+		var id := id_stone
+		if y == 0:
+			id = id_bedrock
+		elif y == top:
+			id = id_grass
+		elif y > top - 4:
+			id = id_soil
+		for lz in Const.CHUNK_SIZE:
+			for lx in Const.CHUNK_SIZE:
+				chunk.blocks[Chunk.index(lx, ly, lz)] = id
+	chunk.recount()
+	chunk.populated = true
+
+
+## Resolve a block name with a fallback, so a missing content pack degrades to
+## something solid rather than to air.
+func _block_id(name: StringName, fallback: StringName) -> int:
+	if Blocks.has(name):
+		return Blocks.id(name)
+	if Blocks.has(fallback):
+		return Blocks.id(fallback)
+	return Const.AIR
 
 
 ## Hand the finished chunk to the structure agent, if it has landed yet.
@@ -190,8 +239,15 @@ func biome_at(x: int, z: int) -> StringName:
 
 
 ## Surface height at a column, without loading the chunk.
+##
+## Must agree with whatever `generate_chunk` actually builds. A superflat world
+## has no heightfield at all, and returning the noise height there spawned the
+## player ~32 blocks above the ground, which killed them on arrival.
 func height_at(x: int, z: int) -> int:
 	_ensure()
+	if generator != &"planet":
+		return clampi(int(meta.get("flat_height", meta.get("surface_level", 64))),
+			0, Const.WORLD_HEIGHT - 1)
 	return shaper.height_at(x, z)
 
 

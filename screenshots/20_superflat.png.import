@@ -2,16 +2,16 @@
 
 importer="texture"
 type="CompressedTexture2D"
-uid="uid://dbtody7pt6d0y"
-path="res://.godot/imported/20_night.png-32e161c9f38c3bfc49b01e1a48506f46.ctex"
+uid="uid://byvkkbf1r3h4x"
+path="res://.godot/imported/20_superflat.png-c5e222c492559e755b216ef571c62dbc.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://screenshots/20_night.png"
-dest_files=["res://.godot/imported/20_night.png-32e161c9f38c3bfc49b01e1a48506f46.ctex"]
+source_file="res://screenshots/20_superflat.png"
+dest_files=["res://.godot/imported/20_superflat.png-c5e222c492559e755b216ef571c62dbc.ctex"]
 
 [params]
 

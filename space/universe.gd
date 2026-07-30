@@ -110,6 +110,11 @@ signal capabilities_changed()
 const SHIP_ID := "ship"
 ## World id of the social hub. See `space/outpost.gd`.
 const OUTPOST_ID := "outpost"
+## World id of the flat testing world. Always present, always in the home
+## system, always reachable for free, and always free of hostiles.
+const SUPERFLAT_ID := "superflat"
+## Y level of the superflat grass course.
+const SUPERFLAT_GROUND := 64
 
 const SECTOR_COUNT := 6
 const SYSTEMS_MIN := 6
@@ -268,6 +273,7 @@ func generate(p_seed: int) -> void:
 	# The home system, the outpost and the ship are known from the first minute.
 	discover(SHIP_ID)
 	discover(OUTPOST_ID)
+	discover(SUPERFLAT_ID)
 	for bid: String in system_body_ids(home_system):
 		discover(bid)
 	# The homeworld is already fully surveyed — that is why you are heading there.
@@ -797,6 +803,55 @@ func _gen_fixed_worlds() -> void:
 		body_order.append(OUTPOST_ID)
 		(systems[sys_id]["bodies"] as Array).append(OUTPOST_ID)
 
+	# --- the superflat proving ground -------------------------------------
+	# A featureless flat world, parked in the home system, reachable for free
+	# from the first minute and guaranteed hostile-free. It exists so building,
+	# physics and the perspective mechanic can be tested against terrain with no
+	# confounding variables, and so every run has somewhere safe to experiment.
+	var flat_meta := _fixed_meta(SUPERFLAT_ID, "Proving Ground", "planet", 0, sys, sec)
+	flat_meta["type"] = "plains"
+	flat_meta["type_name"] = "Superflat"
+	flat_meta["size_x"] = 256
+	flat_meta["size_z"] = 256
+	flat_meta["generator"] = "superflat"
+	flat_meta["flat_height"] = SUPERFLAT_GROUND
+	flat_meta["surface_level"] = SUPERFLAT_GROUND
+	flat_meta["sea_level"] = 0
+	flat_meta["breathable"] = true
+	flat_meta["temperature"] = 0.0
+	flat_meta["radiation"] = 0.0
+	flat_meta["gravity"] = 1.0
+	flat_meta["hazard"] = "none"
+	flat_meta["hazard_strength"] = 0.0
+	flat_meta["weather_set"] = ["clear"]
+	flat_meta["weather_bias"] = 0.0
+	flat_meta["cave_density"] = 0.0
+	flat_meta["vegetation"] = 0.0
+	flat_meta["dungeon"] = ""
+	flat_meta["dungeon_count"] = 0
+	flat_meta["structures"] = []
+	flat_meta["biome_weights"] = {"plains": 1.0}
+	flat_meta["primary_biome"] = "plains"
+	flat_meta["sky_type"] = "day_night"
+	flat_meta["ambient_light"] = 0.35
+	# Read by `entities/entity_manager.gd`: nothing hostile ever spawns here.
+	flat_meta["hostiles"] = false
+	planets[SUPERFLAT_ID] = flat_meta
+	if sys_id != "" and systems.has(sys_id):
+		bodies[SUPERFLAT_ID] = {
+			"id": SUPERFLAT_ID, "name": "Proving Ground",
+			"kind": "planet", "type": "plains", "type_name": "Superflat",
+			"threat": 0, "landable": true,
+			"system_id": sys_id, "sector_id": sec_id,
+			"parent_id": "", "orbit_index": 1, "orbit_radius": 0.30,
+			"orbit_angle": rng.randf() * TAU,
+			"color": Color(0.62, 0.82, 0.48), "size_px": 0.8, "moons": [],
+			"description": "A featureless flat world. No weather, no hazards, "
+				+ "nothing hostile. Kept for testing and for building in peace.",
+		}
+		body_order.append(SUPERFLAT_ID)
+		(systems[sys_id]["bodies"] as Array).append(SUPERFLAT_ID)
+
 
 func _fixed_meta(id: String, display: String, kind: String, threat: int,
 		sys: Dictionary, sec: Dictionary) -> Dictionary:
@@ -977,7 +1032,8 @@ func select(id: String) -> void:
 
 ## Fuel needed to jump to `id` from where the ship currently is.
 func fuel_cost_to(id: String) -> int:
-	if id == reference_body_id() or id == SHIP_ID:
+	# The proving ground is a testing convenience, never a progression gate.
+	if id == reference_body_id() or id == SHIP_ID or id == SUPERFLAT_ID:
 		return 0
 	var to_sys: String = String(bodies.get(id, {}).get("system_id", ""))
 	var from_sys := current_system_id()

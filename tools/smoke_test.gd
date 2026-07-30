@@ -121,6 +121,55 @@ func _run() -> void:
 		check("blocked shift left no state", not View.shifting and View.layer == layer_before,
 			"destination occupied, refused cleanly")
 
+	# ------------------------------------------------- superflat proving ground
+	print("-- superflat test world --")
+	var flat_id: String = Universe.SUPERFLAT_ID
+	check("superflat world exists", Universe.planet_meta(flat_id).has("id"), flat_id)
+	check("superflat is discovered from the start", Universe.is_discovered(flat_id))
+	check("superflat is in the home system",
+		Universe.system_body_ids(Universe.current_system_id()).has(flat_id)
+			or Universe.system_body_ids(Universe.home_system).has(flat_id))
+	check("superflat costs no fuel", Universe.fuel_cost_to(flat_id) == 0,
+		"%d fuel" % Universe.fuel_cost_to(flat_id))
+	var gate: Dictionary = Universe.can_travel_to(flat_id)
+	check("superflat is reachable now", bool(gate.get("ok", false)),
+		String(gate.get("reason", "")))
+	check("superflat declares no hostiles",
+		not bool(Universe.planet_meta(flat_id).get("hostiles", true)))
+
+	# Actually travel there and inspect the terrain.
+	Game.travel_to_planet(flat_id)
+	await _frames(240)
+	check("landed on superflat", World.planet_id == flat_id, World.planet_id)
+	var ground: int = int(Universe.planet_meta(flat_id).get("flat_height", 64))
+	var flat_ok := true
+	var sample := ""
+	for dx in [-6, 0, 7]:
+		for dz in [-6, 0, 7]:
+			var col_x: int = (World.size_x >> 1) + dx
+			var col_z: int = (World.size_z >> 1) + dz
+			var g := World.ground_y(col_x, col_z)
+			if g != ground:
+				flat_ok = false
+				sample = "column (%d,%d) ground %d, expected %d" % [col_x, col_z, g, ground]
+			if not World.is_air(Vector3i(col_x, ground + 1, col_z)):
+				flat_ok = false
+				sample = "column (%d,%d) is not clear above the surface" % [col_x, col_z]
+	check("superflat terrain is flat", flat_ok, sample if sample != "" else "ground y=%d" % ground)
+	var em: Node = Game.entities_root
+	check("hostile population cap is zero on superflat",
+		em != null and em.has_method(&"population_cap") and int(em.call(&"population_cap")) == 0)
+
+	# --------------------------------------------------------- starting kit
+	print("-- starting kit --")
+	var inv: Variant = p.get("inventory")
+	var dirt := 0
+	if inv != null and inv.has_method(&"count_of"):
+		dirt = int(inv.call(&"count_of", &"dirt"))
+	elif p.has_method(&"count_item"):
+		dirt = int(p.call(&"count_item", &"dirt"))
+	check("player starts with 99 dirt", dirt == 99, "%d dirt" % dirt)
+
 	# ------------------------------------------------------------ plane maths
 	print("-- plane-space round trip --")
 	var ok_round := true

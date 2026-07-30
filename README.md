@@ -52,11 +52,27 @@ generated procedurally at runtime.
 Every binding is rebindable in Options → Controls, and the HUD reads its own
 key prompts from the live `InputMap`, so they stay correct after a rebind.
 
+## Testing conveniences
+
+Every run generates a **Proving Ground** — a Minecraft-style superflat world
+(bedrock, stone, soil, a grass course at y=64, nothing else). It is parked in the
+home system, discovered from the first minute, costs **no fuel**, and is flagged
+`hostiles = false`, so `entities/entity_manager.gd` never spawns anything
+aggressive there. It exists so building, physics, the flip and the layer shift
+can be exercised against terrain with no confounding variables — and so every run
+has somewhere safe to experiment. Fly to it from the star map (`M`).
+
+The player also starts with **99 dirt** (`Game.STARTING_KIT`) so building can be
+tested without mining first.
+
+Both are deliberately part of the shipped game rather than a debug flag: a
+testing world you have to enable is a testing world nobody uses.
+
 ## Verifying a build
 
 ```
 godot --headless --import --path .               # compile everything
-godot --headless --path . tools/smoke_test.tscn  # 20 integration assertions
+godot --headless --path . tools/smoke_test.tscn  # 33 integration assertions
 godot --headless --path . tools/save_test.tscn   # 12 persistence round-trips
 godot --path .              tools/playthrough.tscn # scripted play + screenshots
 godot --headless --path . tools/perf_probe.tscn  # chunk generation cost

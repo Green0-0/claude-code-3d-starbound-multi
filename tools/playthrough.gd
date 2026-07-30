@@ -111,6 +111,7 @@ func _run() -> void:
 	await _beat_planet()
 	await _beat_mine_and_place()
 	await _beat_combat()
+	await _beat_superflat()
 	await _beat_night()
 	await _beat_save()
 
@@ -400,6 +401,42 @@ func _beat_combat() -> void:
 		# `on_death` may free the node outright, so check validity first.
 		ok("monster can be killed", not is_instance_valid(m) or m.dead)
 	await shot("after_combat")
+
+
+func _beat_superflat() -> void:
+	print("-- superflat proving ground --")
+	var flat_id: String = Universe.SUPERFLAT_ID
+	ok("proving ground reachable", bool(Universe.can_travel_to(flat_id).get("ok", false)))
+	var p := player()
+	# Compare against health *before* the trip: earlier beats have already taken
+	# chunks out of the player, so "full health" is not the right bar.
+	var hp_before: float = p.health if p != null else 0.0
+	Game.travel_to_planet(flat_id)
+	await _frames(300)
+	ok("landed on the proving ground", World.planet_id == flat_id, World.planet_id)
+	if p != null:
+		ok("arrived unharmed", p.health >= hp_before - 0.5,
+			"%.0f -> %.0f hp" % [hp_before, p.health])
+	var em: Node = Game.entities_root
+	if em != null and em.has_method(&"population_cap"):
+		ok("no hostiles here", int(em.call(&"population_cap")) == 0)
+	var inv: Variant = p.get("inventory") if p != null else null
+	var dirt := 0
+	if inv != null and inv.has_method(&"count_of"):
+		dirt = int(inv.call(&"count_of", &"dirt"))
+	ok("still carrying the test dirt", dirt >= 99, "%d dirt" % dirt)
+	await shot("superflat")
+	# Build something with the starting dirt to prove the kit is usable.
+	if p != null:
+		var feet := Const.floor_v(p.global_position)
+		var built := 0
+		for i in 6:
+			var q := feet + View.right() * (2 + i) + Vector3i(0, i / 2, 0)
+			if World.is_air(q) and World.place_block(q, Blocks.id(&"dirt")):
+				built += 1
+		await _frames(40)
+		ok("built a staircase from the starting dirt", built >= 4, "%d blocks" % built)
+	await shot("superflat_built")
 
 
 func _beat_night() -> void:
