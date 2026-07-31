@@ -74,6 +74,9 @@ func _run() -> void:
 	print("== bestiary")
 	_bestiary()
 
+	print("== taming")
+	await _taming()
+
 	print("== quests")
 	_quests()
 
@@ -81,7 +84,7 @@ func _run() -> void:
 	_cutaway()
 
 	print("== cutaway modes")
-	_cutaway_modes()
+	await _cutaway_modes()
 
 	print("== space")
 	_space()
@@ -416,27 +419,268 @@ func _bestiary() -> void:
 			"hp %.0f -> %.0f" % [hp_before, m.health])
 		m.queue_free()
 
-	# --- taming: the right food, offered to a calm creature
-	var t: Monster = game.spawn_monster(&"yokat",
-		Vector3(feet.x + 7, feet.y + 1, feet.z), 1.0)
-	if t != null:
-		t.alert = 0.0
-		t.fear = 0.0
-		check("a creature refuses food it does not eat", not t.offer(&"cobblestone"))
-		check("a creature takes food it does eat", t.offer(&"wheat"))
-		t.alert = 0.0
-		t.fear = 0.0
-		t.offer(&"wheat")
-		t.alert = 0.0
-		t.fear = 0.0
-		t.offer(&"wheat")
-		check("enough of it wins the creature over", t.tamed)
-		check("a tamed creature is not hostile", not t.is_hostile())
-		t.queue_free()
-
 	check("no procedurally generated species are in the pool",
 		SpeciesDB.pool_for(&"forest", 9).all(
 			func(d: SpeciesDB.Def) -> bool: return d.description != ""))
+
+
+# =============================================================================
+# taming
+# =============================================================================
+#
+# Two systems that must not be allowed to collapse into one: the passive route
+# is a die roll gated by conditions, the knockout route is a resource drain
+# gated by torpor. Both end in the same tamed creature, and the checks below
+# hold each of them to its own rules.
+
+func _taming() -> void:
+	TameDB.boot()
+
+	# --- the table itself
+	check("every creature has a taming profile",
+		SpeciesDB.defs.all(func(d: SpeciesDB.Def) -> bool:
+			return TameDB.get_profile(d.id) != null),
+		"%d profiles" % TameDB.profiles.size())
+
+	var poptop := TameDB.get_profile(&"poptop")
+	var fourfold := TameDB.get_profile(&"boss_fourfold")
+	check("the tame ones are tame and the exotic ones are not",
+		poptop.wildness < 0.3 and fourfold.wildness > 0.9,
+		"poptop %.2f, fourfold %.2f" % [poptop.wildness, fourfold.wildness])
+	check("wildness gates the handling skill required",
+		poptop.min_handling == 0 and fourfold.min_handling > 10,
+		"%d vs %d" % [poptop.min_handling, fourfold.min_handling])
+	check("the exotic ones carry stringent conditions",
+		poptop.conditions.is_empty() and fourfold.conditions.size() >= 3
+		and TameDB.get_profile(&"ixodoom").conditions.size() >= 3)
+
+	# RimWorld's curve, checked at both ends.
+	check("taming odds follow (4%% + 3%% x skill) x 2 x (1 - wildness)",
+		is_equal_approx(poptop.tame_chance(0), 0.08 * (1.0 - poptop.wildness))
+		and is_equal_approx(poptop.tame_chance(6), 0.44 * (1.0 - poptop.wildness)),
+		"%.3f at 0, %.3f at 6" % [poptop.tame_chance(0), poptop.tame_chance(6)])
+	check("skill raises the odds", fourfold.tame_chance(20) > fourfold.tame_chance(0))
+
+	check("kibble works on everything", poptop.food_quality(&"kibble") > 1.5
+		and TameDB.get_profile(&"ixodoom").food_quality(&"kibble") > 1.5)
+	check("plain feed works on everything, slowly",
+		poptop.food_quality(&"creature_feed") > 0.0
+		and poptop.food_quality(&"creature_feed") < 1.0)
+	check("a creature still refuses what it does not eat",
+		poptop.food_quality(&"cobblestone") == 0.0)
+
+	# --- the handler skill
+	var skill_before := player.handling_skill()
+	player.gain_handling(200.0)
+	check("handling is a skill that grows", player.handling_skill() > skill_before,
+		"%d -> %d" % [skill_before, player.handling_skill()])
+
+	var feet := player.feet_block()
+
+	# --- passive route
+	var y: Monster = game.spawn_monster(&"yokat",
+		Vector3(feet.x + 7, feet.y + 1, feet.z), 1.0)
+	check("a creature spawns to tame", y != null)
+	if y != null:
+		y.alert = 0.0
+		y.fear = 0.0
+		player.crouching = true
+		var wrong := y.tame_report(&"cobblestone", 30)
+		check("it refuses food it does not eat", not wrong.get("ok", false))
+		var right := y.tame_report(&"wheat", 30)
+		check("it considers food it does eat", right.get("ok", false),
+			String(right.get("reason", "")))
+		check("the report states the odds", float(right.get("chance", 0.0)) > 0.0)
+
+		# Standing up breaks the yokat's crouch condition, and the report has to
+		# say so rather than failing silently.
+		player.crouching = false
+		var standing := y.tame_report(&"wheat", 30)
+		check("an unmet condition blocks the attempt and is named",
+			not standing.get("ok", false)
+			and standing.get("unmet", []).has(TameDB.COND_CROUCH))
+		player.crouching = true
+
+		# Drive it to a result. With handling 30 against wildness 0.35 the odds
+		# per attempt are high, so a few tries is plenty.
+		var tries := 0
+		while not y.tamed and tries < 40:
+			y.alert = 0.0
+			y.fear = 0.0
+			y.tame_cooldown = 0.0
+			y.try_tame(&"wheat", 30)
+			tries += 1
+		check("a passive tame succeeds with skill and the right food", y.tamed,
+			"%d attempts" % tries)
+		check("a tamed creature is not hostile", not y.is_hostile())
+		check("taming teaches the handler", player.handling_skill() > 0)
+
+		# --- culture: obedience first, everything else after
+		check("haul cannot be taught before obedience",
+			not y.can_be_trained(&"haul") and y.can_be_trained(&"obedience"))
+		var lesson := 0
+		while not y.knows(&"obedience") and lesson < 40:
+			y.train(&"obedience")
+			lesson += 1
+		check("obedience can be taught", y.knows(&"obedience"))
+		check("haul unlocks once it obeys", y.can_be_trained(&"haul"))
+		while not y.knows(&"haul") and lesson < 80:
+			y.train(&"haul")
+			lesson += 1
+		check("a trained creature will carry things", y.can_carry())
+
+		# --- inventory
+		var left: int = y.store(Items.make(&"cobblestone", 12))
+		check("a tame has an inventory you can fill",
+			left == 0 and y.carried_count() == 12,
+			"%d slots, %d left over" % [y.carry_capacity, left])
+		var drops_before: int = game.drops_root.get_child_count()
+		y.drop_inventory()
+		await _settle(3)
+		check("what it carries comes back when it dies",
+			game.drops_root.get_child_count() > drops_before
+			and y.carried_count() == 0)
+		y.queue_free()
+	player.crouching = false
+
+	# --- knockout route
+	var v: Monster = game.spawn_monster(&"voltip",
+		Vector3(feet.x + 9, feet.y + 1, feet.z), 1.0)
+	check("a knockout creature spawns", v != null)
+	if v != null:
+		await _settle(2)
+		var prof := v.profile()
+		check("it cannot be tamed by hand", prof.method == TameDB.METHOD_KNOCKOUT)
+		var awake := v.tame_report(&"raw_meat", 30)
+		check("it will not take food while awake", not awake.get("ok", false),
+			String(awake.get("reason", "")))
+
+		# Torpor, not damage.
+		var hp_before: float = v.health
+		v.apply_torpor(v.torpor_max * 0.5)
+		check("torpor accumulates without hurting it",
+			v.torpor > 0.0 and v.health == hp_before and not v.unconscious,
+			"torpor %.0f/%.0f" % [v.torpor, v.torpor_max])
+		v.apply_torpor(v.torpor_max)
+		check("enough torpor puts it under", v.unconscious)
+		check("an unconscious creature stops acting",
+			v.tame_effectiveness == 1.0 and v.tame_feed == 0)
+
+		# Ark's central trade: hitting it while it sleeps costs you quality.
+		var eff_before: float = v.tame_effectiveness
+		v.hurt(v.max_health * 0.3, Blocks.ELEM_PHYSICAL, Vector3.ZERO, player)
+		check("hurting it while under costs taming effectiveness",
+			v.tame_effectiveness < eff_before and v.unconscious,
+			"%.2f -> %.2f" % [eff_before, v.tame_effectiveness])
+
+		var bad := v.feed_unconscious(&"cobblestone")
+		check("it still will not eat rubble", not bad.get("ok", false))
+
+		var narc_before: float = v.torpor
+		var narc := v.feed_unconscious(&"narcotic")
+		check("narcotics top the torpor back up",
+			narc.get("ok", false) and narc.get("narcotic", false)
+			and v.torpor > narc_before,
+			"%.0f -> %.0f" % [narc_before, v.torpor])
+
+		# Ark's real loop: fill the sleeping creature's own bag and let it work
+		# through the stack while you keep the torpor up.
+		check("a wild creature already has an inventory",
+			v.carry_capacity > 0 and v.inventory.size() == v.carry_capacity,
+			"%d slots" % v.carry_capacity)
+		check("you can load a sleeping creature's bag",
+			v.store(Items.make(&"raw_meat", 20)) == 0)
+		var carried_before: int = v.carried_count()
+		v._feed_cd = 0.0
+		v._eat_from_bag()
+		check("it eats out of its own bag while it sleeps",
+			v.carried_count() < carried_before and v.tame_feed > 0,
+			"%d -> %d carried" % [carried_before, v.carried_count()])
+
+		var fed := 0
+		while not v.tamed and fed < 60:
+			v._feed_cd = 0.0
+			v.torpor = v.torpor_max
+			v._eat_from_bag()
+			fed += 1
+		check("feeding it while it sleeps tames it", v.tamed, "%d bites" % fed)
+		check("the finished creature keeps its reduced effectiveness",
+			v.tame_effectiveness < 1.0,
+			"%d%%" % int(v.tame_effectiveness * 100.0))
+		check("it wakes up tame", not v.unconscious and v.torpor == 0.0)
+		v.queue_free()
+
+	# --- torpor is not a way round a shell
+	var c: Monster = game.spawn_monster(&"crustoise",
+		Vector3(feet.x + 11, feet.y + 1, feet.z), 1.0)
+	if c != null:
+		var soaked: float = c.torpor
+		c.apply_torpor(60.0)
+		var through_shell: float = c.torpor - soaked
+		c.shell = 0.0
+		c.torpor = 0.0
+		c.apply_torpor(60.0)
+		check("a shell keeps darts out as surely as blades",
+			through_shell < c.torpor * 0.5,
+			"%.0f through shell vs %.0f without" % [through_shell, c.torpor])
+		check("the crustoise demands its shell be broken first",
+			c.profile().conditions.has(TameDB.COND_SHELL_BROKEN))
+		c.queue_free()
+
+	# --- restraint satisfies "boxed in" without building a box
+	var md: Monster = game.spawn_monster(&"mandraflora",
+		Vector3(feet.x + 13, feet.y + 1, feet.z), 1.0)
+	if md != null:
+		check("the mandraflora must be trapped",
+			md.profile().conditions.has(TameDB.COND_TRAPPED))
+		check("out in the open it is not trapped",
+			md.unmet_conditions().has(TameDB.COND_TRAPPED))
+		md.restrained = 20.0
+		check("a net counts as walls",
+			not md.unmet_conditions().has(TameDB.COND_TRAPPED))
+		md.queue_free()
+
+	# --- maintenance taming: wildness pulls a tame back to wild
+	var p2: Monster = game.spawn_monster(&"poptop",
+		Vector3(feet.x + 15, feet.y + 1, feet.z), 1.0)
+	if p2 != null:
+		p2.finish_tame(1.0)
+		p2.bonded = false
+		check("a fresh tame is loyal", p2.tamed and p2.tame_decay == 0.0)
+		p2.tame_decay = 0.99
+		p2._tick_tame_decay(120.0)
+		check("an unmaintained tame goes feral", not p2.tamed)
+		p2.finish_tame(1.0)
+		p2.bonded = false
+		p2.tame_decay = 0.8
+		check("feeding it resets the drift", p2.tend(&"carrot")
+			and p2.tame_decay < 0.8)
+		p2.bonded = true
+		p2.tame_decay = 0.99
+		p2._tick_tame_decay(1.0)
+		check("a bonded creature never drifts", p2.tamed)
+		p2.queue_free()
+
+	# --- the sedative kit exists and is actually sedative
+	for id: StringName in [&"tranq_arrow", &"tranq_dart", &"tranq_rifle",
+			&"narcotic", &"stimulant", &"bola", &"capture_net",
+			&"handlers_collar", &"saddlebag", &"kibble", &"creature_feed"]:
+		check("%s is craftable gear" % id, Items.has(id))
+	check("tranquiliser rounds carry torpor, not damage",
+		Items.get_type(&"tranq_dart").torpor > 20.0
+		and Items.get_type(&"tranq_dart").damage == 0.0)
+	check("a stimulant removes torpor rather than adding it",
+		Items.get_type(&"stimulant").torpor < 0.0)
+	# Nobody lands with a tranquiliser rifle, so the bottom of the kit has to be
+	# makeable bare-handed on the first afternoon.
+	for id: StringName in [&"sap_club", &"bola"]:
+		var made := Crafting.get_recipe(String(id))
+		check("%s can be made bare-handed on the first day" % id,
+			made != null and made.station == &"hand"
+			and made.unlock == Crafting.Unlock.START)
+	check("plain feed needs no more than a workbench",
+		Crafting.get_recipe("creature_feed") != null
+		and Crafting.get_recipe("creature_feed").unlock == Crafting.Unlock.START)
 
 
 func _quests() -> void:
@@ -521,29 +765,53 @@ func _cutaway_modes() -> void:
 		str(hit.get("block", "nothing")))
 	world.set_block(side.x, side.y, side.z, Blocks.AIR)
 
-	# --- fill only travels through covered air
-	var roofed := Vector3i(feet.x + 6, feet.y, feet.z)
-	for dy in range(0, 4):
-		for dx in range(-1, 4):
-			for dz in range(-2, 3):
-				world.set_block(roofed.x + dx, roofed.y + dy, roofed.z + dz, Blocks.AIR)
-	for dx in range(-1, 4):
-		for dz in range(-2, 3):
-			world.set_block(roofed.x + dx, roofed.y + 4, roofed.z + dz, Blocks.STONE)
-	check("a roofed pocket counts as covered",
-		world.is_covered(roofed.x, roofed.y, roofed.z))
-	check("open sky does not count as covered",
-		not world.is_covered(feet.x, VoxelWorld.WH - 2, feet.z))
-
+	# --- fill reveals the enclosed space the player is standing in, and only
+	# that. Outdoors there is nothing enclosed, so it stands aside.
 	world.set_cutaway_mode(Cutaway.Mode.FILL)
 	world.update_cutaway(cam, target)
 	world._rebuild_fill()
-	check("fill mode produces a volume", cut.fill_size.x > 0)
+	check("open sky is not an enclosed space", cut.fill_empty)
+	var sight_mid := (cut.camera_position + cut.target_position) * 0.5
+	check("with no pocket, fill falls back to the drill",
+		cut.is_cut(int(floor(sight_mid.x)), int(floor(sight_mid.y)),
+			int(floor(sight_mid.z))))
+
+	# carve a sealed room a little away and stand the player in it
+	var room := Vector3i(feet.x + 8, feet.y, feet.z)
+	for dx in range(-2, 5):
+		for dz in range(-3, 4):
+			for dy in range(-1, 6):
+				world.set_block(room.x + dx, room.y + dy, room.z + dz,
+					Blocks.STONE if (dy == -1 or dy == 5) else Blocks.AIR)
+	check("a roofed pocket counts as covered",
+		world.is_covered(room.x, room.y, room.z))
+	check("open sky does not count as covered",
+		not world.is_covered(feet.x, VoxelWorld.WH - 2, feet.z))
+
+	var room_target := Vector3(room) + Vector3(0.5, 0.0, 0.5)
+	world.update_cutaway(room_target + Vector3(0, 15, -22), room_target)
+	world._rebuild_fill()
+	check("fill finds the room", not cut.fill_empty and cut.fill_size.x > 0)
+	check("fill covers the whole room, not a cone",
+		cut.in_fill(room.x + 3, room.y + 2, room.z + 2), "far corner of the room")
 	check("fill never marks the open sky",
 		not cut.in_fill(feet.x, VoxelWorld.WH - 2, feet.z))
+	# The shadow is a diagonal corridor toward the lens, not a vertical column,
+	# so scan for it rather than guessing one cell.
+	var occluders := 0
+	for dz in range(-10, 1):
+		for dy in range(5, 14):
+			if cut.is_cut(room.x, room.y + dy, room.z + dz):
+				occluders += 1
+	check("fill removes what stands between the room and the lens",
+		occluders > 0, "%d cells above the room" % occluders)
+
+	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+	world.update_cutaway(cam, target)
 
 	# --- planar stays dormant until something is genuinely in the way
 	world.set_cutaway_mode(Cutaway.Mode.PLANAR)
+	world.update_cutaway(cam, target)
 	cut.occluded = false
 	var front := Vector3i(feet.x, feet.y + 1, feet.z - 6)
 	check("planar cuts nothing while you are in the open",
@@ -562,6 +830,31 @@ func _cutaway_modes() -> void:
 	world.set_cutaway_opacity(0.0)
 	check("deleted blocks are not targetable in the primary pass",
 		not cut.selectable_in_primary())
+
+	# --- the whole point of quantising: standing still costs nothing at all
+	for mode: int in [Cutaway.Mode.CYLINDER, Cutaway.Mode.FILL, Cutaway.Mode.PLANAR]:
+		world.set_cutaway_mode(mode)
+		player.velocity = Vector3.ZERO
+		await _settle(6)
+		var before: int = world.cut_rebuilds
+		for i in 30:
+			world.update_cutaway(cut.camera_position + Vector3(0.31, 0.07, -0.19),
+				cut.target_position + Vector3(0.11, 0.0, 0.09))
+			await get_tree().process_frame
+		check("%s mode rebuilds nothing while you stand still" % cut.mode_name(),
+			world.cut_rebuilds == before,
+			"%d rebuilds over 30 frames" % (world.cut_rebuilds - before))
+	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+
+	# --- and breaking a block does force one, so no stale cross-section is left
+	var feet2 := player.feet_block()
+	world.set_block(feet2.x + 2, feet2.y, feet2.z, Blocks.STONE)
+	await _settle(3)
+	var before_break: int = world.cut_rebuilds
+	world.set_block(feet2.x + 2, feet2.y, feet2.z, Blocks.AIR)
+	await _settle(3)
+	check("breaking a block rebuilds the cross-section immediately",
+		world.cut_rebuilds > before_break)
 
 
 func _space() -> void:

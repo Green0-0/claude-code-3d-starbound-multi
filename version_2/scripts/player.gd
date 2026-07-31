@@ -774,6 +774,38 @@ func is_sneaking() -> bool:
 	return crouching
 
 
+# =============================================================================
+# animal handling
+# =============================================================================
+#
+# The one skill the player carries, because taming is the one system that needs
+# to be gated by experience rather than by equipment. Every creature has a
+# minimum handling level below which it will not tolerate anyone, and the odds
+# on a passive attempt scale directly off it.
+
+var handling_xp := 0.0
+
+
+func handling_skill() -> int:
+	# Each level costs a little more than the last, so the early ones come from
+	# taming a few poptops and the late ones do not.
+	return int(floor(sqrt(handling_xp / 3.0)))
+
+
+func handling_progress() -> float:
+	var lvl := handling_skill()
+	var here := 3.0 * float(lvl * lvl)
+	var next := 3.0 * float((lvl + 1) * (lvl + 1))
+	return clampf((handling_xp - here) / maxf(next - here, 1.0), 0.0, 1.0)
+
+
+func gain_handling(amount: float) -> void:
+	var before := handling_skill()
+	handling_xp = maxf(handling_xp + amount, 0.0)
+	if handling_skill() > before:
+		stats_changed.emit()
+
+
 ## Block the player's feet occupy — the anchor for the whole cutaway system.
 func feet_block() -> Vector3i:
 	return Vector3i(
@@ -792,6 +824,7 @@ func save_state() -> Dictionary:
 		"spawn": [_spawn_point.x, _spawn_point.y, _spawn_point.z],
 		"health": health, "energy": energy,
 		"inventory": inventory.to_dict(),
+		"handling_xp": handling_xp,
 		"stats": stats.save_state() if stats != null else {},
 	}
 
@@ -804,6 +837,7 @@ func load_state(d: Dictionary) -> void:
 	health = float(d.get("health", max_health))
 	energy = float(d.get("energy", max_energy))
 	inventory.from_dict(d.get("inventory", {}))
+	handling_xp = float(d.get("handling_xp", 0.0))
 	if stats != null:
 		stats.load_state(d.get("stats", {}))
 	_alive = health > 0.0

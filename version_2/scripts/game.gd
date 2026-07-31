@@ -736,9 +736,9 @@ func quick_deposit(container: PlacedObject) -> void:
 # =============================================================================
 
 func player_interact(who: Player) -> void:
-	# A creature you are holding food for comes before anything else, because
-	# that is unambiguously what you meant by walking up to it holding food.
-	if _try_feed(who):
+	# A creature within arm's reach comes before anything else: walking up to an
+	# animal and pressing the interact key is never ambiguous.
+	if _try_creature(who):
 		return
 	# NPCs next: they are what you usually mean
 	var npc := _nearest(npcs_root, who.global_position, 3.2) as Npc
@@ -772,35 +772,198 @@ func player_interact(who: Player) -> void:
 			obj.interact(who)
 
 
-## Offer the held stack to the nearest creature that eats it. Works best while
-## crouched and at a distance it has not already panicked at.
-func _try_feed(who: Player) -> bool:
-	var stack := who.held_stack()
-	if stack.is_empty():
-		return false
+# =============================================================================
+# creatures
+# =============================================================================
+
+## The nearest creature you could plausibly be reaching for. An unconscious one
+## wins ties, because you are almost certainly there to feed it.
+func creature_in_reach(who: Player, radius := 4.0) -> Monster:
 	var best: Monster = null
-	var best_d := 4.0
+	var best_score := -1.0
 	for n in monsters_root.get_children():
 		var m := n as Monster
-		if m == null or m.tamed or not m.species.likes(stack.id):
+		if m == null:
 			continue
 		var d := m.global_position.distance_to(who.global_position)
-		if d < best_d:
-			best_d = d
+		if d > radius:
+			continue
+		var score := radius - d
+		if m.unconscious:
+			score += 10.0
+		elif m.tamed:
+			score += 5.0
+		if score > best_score:
+			best_score = score
 			best = m
-	if best == null:
+	return best
+
+
+## Everything the interact key does to an animal, in the order somebody walking
+## up to one would expect.
+func _try_creature(who: Player) -> bool:
+	var m := creature_in_reach(who)
+	if m == null:
 		return false
-	if not best.offer(stack.id):
-		notify("The %s is too worked up to take it." % best.display_name(), &"warn")
+	var stack := who.held_stack()
+
+	# --- empty hands on a creature you have a stake in: open its sheet
+	if stack.is_empty():
+		if m.tamed or m.unconscious:
+			ui.open_creature(m)
+			return true
+		return false
+
+	var t := stack.type()
+	if t == null:
+		return false
+
+	# --- restraints, before anything else. A held creature is a tameable one.
+	if t.has_tag(&"restraint"):
+		return _use_restraint(who, stack, m)
+
+	# --- husbandry, on a creature already yours
+	if t.has_tag(&"taming") and (stack.id == &"handlers_collar"
+			or stack.id == &"saddlebag"):
+		return _use_husbandry(who, stack, m)
+
+	# --- the sedative chemistry
+	if stack.id == &"stimulant" and m.unconscious:
+		m.apply_torpor(t.torpor)     # negative: it wakes up
+		_spend_held(who, stack)
+		notify("%s comes awake." % m.nickname(), &"info")
 		return true
+
+	# --- feeding a sleeping creature: narcotics and food both go in the mouth
+	if m.unconscious:
+		var res := m.feed_unconscious(stack.id)
+		if not res.get("ok", false):
+			_explain_refusal(m, res)
+			return true
+		_spend_held(who, stack)
+		bump_stat("creatures_fed", 1)
+		if res.get("narcotic", false):
+			notify("%s sinks deeper. Torpor %d." % [m.species.display,
+				int(m.torpor)], &"info")
+		elif res.get("done", false):
+			bump_stat("creatures_tamed", 1)
+		else:
+			notify("%s eats. %d%% of the way, %d%% effective." % [
+				m.species.display, int(m.tame_progress() * 100.0),
+				int(m.tame_effectiveness * 100.0)], &"info")
+		return true
+
+	# --- an animal already yours: this is maintenance, not taming
+	if m.tamed:
+		if m.tend(stack.id):
+			_spend_held(who, stack)
+			bump_stat("creatures_fed", 1)
+			notify("%s eats from your hand." % m.nickname(), &"info")
+			return true
+		notify("%s has no interest in that." % m.nickname(), &"warn")
+		return true
+
+	# --- and finally the passive attempt
+	var report := m.try_tame(stack.id, who.handling_skill())
+	if not report.get("ok", false):
+		_explain_refusal(m, report)
+		return true
+	_spend_held(who, stack)
+	bump_stat("creatures_fed", 1)
+	if report.get("tamed", false):
+		bump_stat("creatures_tamed", 1)
+	elif report.get("revenge", false):
+		notify("The %s takes the food and turns on you." % m.species.display,
+			&"warn")
+	else:
+		notify("The %s eats, and backs off. (%d%% chance)" % [m.species.display,
+			int(float(report.get("chance", 0.0)) * 100.0)], &"info")
+	return true
+
+
+## Turn a refusal dictionary into one sentence the player can act on. This is
+## the whole interface to the condition system, so it has to be specific.
+func _explain_refusal(m: Monster, res: Dictionary) -> void:
+	var line: String = String(res.get("reason", "It refuses."))
+	var wants: StringName = res.get("wants", &"")
+	if wants != &"":
+		var wt := Items.get_type(wants)
+		if wt != null:
+			line += " It wants %s." % wt.display
+	var method: StringName = res.get("method", &"")
+	if method == TameDB.METHOD_KNOCKOUT or method == TameDB.METHOD_REPAIR:
+		line += " Put it under first."
+	elif method == TameDB.METHOD_TRAP:
+		line += " Box it in first."
+	notify("%s %s" % [m.species.display + ":", line], &"warn")
+
+
+func _use_restraint(who: Player, stack: Items.Stack, m: Monster) -> bool:
+	if m.tamed:
+		notify("%s is already yours." % m.nickname(), &"warn")
+		return true
+	# A net counts as walls; a bola counts as legs that no longer work. Both
+	# express themselves the same way: the creature stops going anywhere, and
+	# for as long as that holds it satisfies "boxed in".
+	var seconds := 12.0 if stack.id == &"bola" else 30.0
+	m.restrained = maxf(m.restrained, seconds)
+	m.apply_torpor(m.torpor_max * (0.35 if stack.id == &"capture_net" else 0.2))
+	m.velocity = Vector3.ZERO
+	_spend_held(who, stack)
+	notify("The %s is tangled — %ds." % [m.species.display, int(seconds)], &"quest")
+	return true
+
+
+func _use_husbandry(who: Player, stack: Items.Stack, m: Monster) -> bool:
+	if not m.tamed:
+		notify("%s is not yours to fit that to." % m.species.display, &"warn")
+		return true
+	if stack.id == &"saddlebag":
+		m.carry_capacity += 8
+		m._ensure_inventory()
+		_spend_held(who, stack)
+		notify("%s can carry %d now." % [m.nickname(), m.carry_capacity], &"info")
+		return true
+	# The collar is the teaching aid: one use, one training attempt, cheapest
+	# skill first so that obedience always comes before anything built on it.
+	for skill: StringName in [&"obedience", &"haul", &"release"]:
+		if not m.can_be_trained(skill):
+			continue
+		_spend_held(who, stack)
+		if m.train(skill):
+			who.gain_handling(2.0)
+		else:
+			notify("%s does not take the lesson." % m.nickname(), &"warn")
+		return true
+	notify("%s has nothing left to learn from you." % m.nickname(), &"info")
+	return true
+
+
+func _spend_held(who: Player, stack: Items.Stack) -> void:
 	stack.count -= 1
 	if stack.count <= 0:
 		stack.clear()
 	who.inventory.changed.emit()
-	bump_stat("creatures_fed", 1)
-	if not best.tamed:
-		notify("The %s eats, and watches you." % best.display_name(), &"info")
-	return true
+
+
+func on_monster_tamed(m: Monster) -> void:
+	quests.on_tamed(m.species.id)
+	notify("Handling %d." % player.handling_skill(), &"info")
+
+
+## Scatter one stack where a creature stood. Used when a tame dies or reverts.
+func drop_item(id: StringName, count: int, at: Vector3) -> void:
+	ItemDrop.spawn(drops_root, world, at, Items.make(id, count))
+
+
+## Every creature currently yours, for the HUD and the journal.
+func tamed_creatures() -> Array[Monster]:
+	var out: Array[Monster] = []
+	for n in monsters_root.get_children():
+		var m := n as Monster
+		if m != null and m.tamed:
+			out.append(m)
+	return out
 
 
 func _use_utility(obj: PlacedObject) -> void:
@@ -844,7 +1007,9 @@ func player_attack(who: Player, stack: Items.Stack) -> void:
 	var knock := 6.0
 	var projectile: StringName = &""
 	var energy := 0.0
+	var torpor := 0.0
 	if t != null:
+		torpor = t.torpor
 		damage = maxf(float(stack.stat("damage", 0.0)), t.damage)
 		element = StringName(stack.stat("element", String(t.element)))
 		knock = float(stack.stat("knockback", t.knockback))
@@ -864,16 +1029,24 @@ func player_attack(who: Player, stack: Items.Stack) -> void:
 		if energy > 0.0 and not who.spend_energy(energy):
 			notify("Out of energy.", &"warn")
 			return
-		if t != null and t.has_tag(&"bow") and not _spend_arrow(who):
-			notify("Out of arrows.", &"warn")
-			return
+		var sedative: bool = t != null and t.has_tag(&"tranquiliser")
+		if t != null and (t.has_tag(&"bow") or sedative):
+			var round_id := _spend_arrow(who, sedative)
+			if round_id == &"":
+				notify("Out of ammunition.", &"warn")
+				return
+			# The dart carries most of the dose; the weapon only delivers it.
+			var round_type := Items.get_type(round_id)
+			if round_type != null:
+				torpor += round_type.torpor
+				damage += round_type.torpor * 0.06
 		var pellets := 7 if (t != null and t.has_tag(&"shotgun")) else 1
 		for i in pellets:
 			var spread := Vector3(_rng.randf_range(-0.08, 0.08),
 				_rng.randf_range(-0.06, 0.06), _rng.randf_range(-0.08, 0.08))
 			spawn_projectile(projectile, origin,
 				(aim + spread * (0.0 if pellets == 1 else 1.0)).normalized(),
-				damage, element, who)
+				damage, element, who, torpor / float(pellets))
 		bump_stat("shots_fired", pellets)
 		return
 
@@ -902,6 +1075,8 @@ func player_attack(who: Player, stack: Items.Stack) -> void:
 		var rolled := Combat.roll_damage(damage,
 			who.inventory.bonus("crit_chance"), _rng)
 		m.hurt(float(rolled[0]), element, to.normalized() * knock + Vector3.UP * 3.0, who)
+		if torpor > 0.0:
+			m.apply_torpor(torpor)
 		on_element_applied(m, element)
 		hud.pop_damage(m.global_position + Vector3(0, m.species.size.y, 0),
 			float(rolled[0]), element, bool(rolled[1]))
@@ -922,12 +1097,19 @@ func _aim_direction(who: Player) -> Vector3:
 	return (Vector3(who.rig.lateral()) * who.facing_sign).normalized()
 
 
-func _spend_arrow(who: Player) -> bool:
-	for id: StringName in [&"bolt", &"iron_arrow", &"arrow"]:
+## Pull one round from the bag and report what it was worth. A tranquiliser
+## weapon looks for sedative ammunition first, because that is unambiguously
+## what somebody holding a tranquiliser rifle meant to load.
+func _spend_arrow(who: Player, sedative := false) -> StringName:
+	var order: Array[StringName] = [&"bolt", &"iron_arrow", &"arrow"]
+	if sedative:
+		order = [&"shock_dart", &"tranq_dart", &"tranq_arrow", &"bolt",
+			&"iron_arrow", &"arrow"]
+	for id: StringName in order:
 		if who.inventory.count_of(id) > 0:
 			who.inventory.remove(id, 1)
-			return true
-	return false
+			return id
+	return &""
 
 
 func _wear_weapon(who: Player, stack: Items.Stack) -> void:
@@ -951,9 +1133,9 @@ func _inside_cut(pos: Vector3) -> bool:
 
 
 func spawn_projectile(kind: StringName, from: Vector3, dir: Vector3,
-		damage: float, element: StringName, source: Node) -> void:
+		damage: float, element: StringName, source: Node, torpor := 0.0) -> void:
 	Projectile.fire(shots_root, world, self, kind, from, dir, damage, element,
-		source, source != player)
+		source, source != player, torpor)
 
 
 func on_element_applied(m: Monster, element: StringName) -> void:

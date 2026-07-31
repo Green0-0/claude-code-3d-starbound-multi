@@ -10,7 +10,7 @@ extends RefCounted
 ## and a hand-written campaign beat are the same object, and the quest log only
 ## ever has to render one shape.
 
-enum Kind { GATHER, KILL, PLACE, CRAFT, VISIT, TALK, DEPTH }
+enum Kind { GATHER, KILL, PLACE, CRAFT, VISIT, TALK, DEPTH, TAME }
 
 
 class Objective extends RefCounted:
@@ -207,6 +207,10 @@ class Manager extends RefCounted:
 
 	func on_block_placed(block_name: StringName) -> void:
 		_advance(Quests.Kind.PLACE, block_name, 1)
+
+	func on_tamed(species_id: StringName) -> void:
+		_advance(Quests.Kind.TAME, species_id, 1)
+		_advance(Quests.Kind.TAME, &"any", 1)
 
 	func on_talked(role: StringName) -> void:
 		_advance(Quests.Kind.TALK, role, 1)

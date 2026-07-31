@@ -88,11 +88,11 @@ cut_planar_depth={
 }
 cut_planar_width={
 "type": "float",
-"value": 5.5
+"value": 5.0
 }
 cut_planar_below={
 "type": "float",
-"value": 1.5
+"value": 1.0
 }
 cut_planar_above={
 "type": "float",
@@ -101,4 +101,20 @@ cut_planar_above={
 cut_occluded={
 "type": "float",
 "value": 0.0
+}
+cut_anchor={
+"type": "vec3",
+"value": Vector3(0, 0, 0)
+}
+cut_toward={
+"type": "vec3",
+"value": Vector3(0, 0, 1)
+}
+cut_lateral={
+"type": "vec3",
+"value": Vector3(1, 0, 0)
+}
+cut_fill_empty={
+"type": "float",
+"value": 1.0
 }

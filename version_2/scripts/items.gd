@@ -71,6 +71,10 @@ class Type extends RefCounted:
 	var energy_cost := 0.0
 	var knockback := 4.0
 	var two_handed := false
+	## Torpor inflicted per hit. Separate from `damage` on purpose: taming
+	## rewards you for putting a creature to sleep without hurting it, so the
+	## two numbers must be able to move in opposite directions.
+	var torpor := 0.0
 
 	# armour
 	var armor_slot: StringName = &""
@@ -175,6 +179,7 @@ class Type extends RefCounted:
 				"energy_cost": energy_cost = float(d[k])
 				"knockback": knockback = float(d[k])
 				"two_handed": two_handed = bool(d[k])
+				"torpor": torpor = float(d[k])
 				"tool_tier": tool_tier = int(d[k])
 				"stack_size": stack_size = int(d[k])
 				"durability": durability = int(d[k])
@@ -325,6 +330,7 @@ const CONTENT := [
 	"res://scripts/content/itm_armor.gd",
 	"res://scripts/content/itm_food.gd",
 	"res://scripts/content/itm_misc.gd",
+	"res://scripts/content/itm_taming.gd",
 ]
 
 

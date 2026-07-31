@@ -20,6 +20,10 @@ global uniform float cut_planar_width;
 global uniform float cut_planar_below;
 global uniform float cut_planar_above;
 global uniform float cut_occluded;
+global uniform vec3 cut_anchor;      // the player's block, in whole voxels
+global uniform vec3 cut_toward;      // unit step from the player toward the lens
+global uniform vec3 cut_lateral;     // unit step across the screen
+global uniform float cut_fill_empty; // 1 when the flood found no enclosed space
 
 // The flood-filled volume, packed as a grid of z-slices. Set per material by
 // VoxelWorld rather than as a global, because global sampler uniforms cannot be
@@ -97,20 +101,16 @@ bool cut_in_fill(vec3 bc) {
 }
 
 
+// An axis-aligned box of whole blocks. `bc` is a block centre, so flooring it
+// and subtracting the anchor recovers the integer offset exactly.
 bool cut_in_slab(vec3 bc) {
-	vec3 axis = cut_cam_pos - cut_target_pos;
-	axis.y = 0.0;
-	if (dot(axis, axis) < 0.0001) {
+	vec3 d = floor(bc) - cut_anchor;
+	float toward = dot(d, cut_toward);
+	if (toward < 1.0 || toward > cut_planar_depth) {
 		return false;
 	}
-	axis = normalize(axis);
-	vec3 d = bc - cut_target_pos;
-	float toward = dot(d, axis);
-	if (toward < 0.5 || toward > cut_planar_depth) {
-		return false;
-	}
-	vec3 lateral = vec3(-axis.z, 0.0, axis.x);
-	if (abs(dot(d, lateral)) > cut_planar_width) {
+	float lat = dot(d, cut_lateral);
+	if (lat < -cut_planar_width || lat > cut_planar_width) {
 		return false;
 	}
 	return d.y >= -cut_planar_below && d.y <= cut_planar_above;
@@ -121,19 +121,18 @@ bool cut_is_cut(vec3 bc) {
 	if (cut_enabled < 0.5) {
 		return false;
 	}
+	if (cut_mode > 1.5) {
+		// The slab only removes what lies toward the lens, so the keep shell has
+		// nothing left to protect, and the cut stays a clean solid box.
+		return cut_occluded > 0.5 && cut_in_slab(bc);
+	}
 	if (cut_is_protected(bc)) {
 		return false;
 	}
-	if (cut_in_cylinder(bc)) {
-		return true;
-	}
-	if (cut_mode > 1.5) {
-		return cut_occluded > 0.5 && cut_in_slab(bc);
-	}
-	if (cut_mode > 0.5) {
+	if (cut_mode > 0.5 && cut_fill_empty < 0.5) {
 		return cut_in_fill(bc);
 	}
-	return false;
+	return cut_in_cylinder(bc);
 }
 
 

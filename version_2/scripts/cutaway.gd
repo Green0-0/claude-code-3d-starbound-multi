@@ -4,83 +4,97 @@ extends RefCounted
 ## ---------------------------------------------------------------------------
 ## Camera Obstruction System
 ##
-## One predicate, evaluated identically on the CPU and the GPU. Three modes
-## share a common core, and every one of them is subject to the same two rules
-## that come before anything else:
+## One predicate, evaluated identically on the CPU and the GPU.
 ##
-##   1. **The keep shell.** Blocks immediately around the player are *never*
-##      cut, unless they lie toward the camera. The floor you are standing on,
-##      the wall beside you and the tree you walked up to stay put — otherwise
-##      the thing you are trying to mine disappears at exactly the moment you
-##      get close enough to mine it.
+## **Everything here is quantised to voxel coordinates.** The cut is anchored to
+## the block the player stands in and to one of the camera's four facings, never
+## to their continuous positions. That is not an approximation — the thing being
+## cut is a grid of blocks, so a cut that slides smoothly between them has
+## nothing to express. What it buys is that the cut set only changes when the
+## player crosses a block boundary or the camera turns, which is what lets the
+## cross-section geometry be cached instead of rebuilt every frame.
 ##
-##   2. **Everything else is cut by mode**:
+## Two rules come before the mode:
 ##
-##      * `CYLINDER` — a drill from the lens to the player. Punches straight
-##        through the roof when you fall down a hole, without gouging out the
-##        rest of the hillside.
-##      * `FILL` — cast to the first air along the sightline, flood-fill the
-##        pocket the player is standing in, and cut everything between that
-##        whole pocket and the lens. A tunnel or a room reads in its entirety
-##        rather than as a cone around you. The fill is *added* range: the cut
-##        still runs all the way to the camera as it always did.
-##      * `PLANAR` — when the player is genuinely occluded, cut a slab of voxel
-##        coordinates in front of them: the classic side-on cross-section.
+##   1. **The keep shell.** Blocks immediately around the player survive unless
+##      they lie toward the lens, so the floor under your feet and the tree you
+##      just walked up to do not evaporate as you approach them.
+##   2. **The mode**:
+##      * `CYLINDER` — a drill from the lens to the player.
+##      * `FILL` — the enclosed air pocket you are standing in, and only what
+##        occludes it. Reveals a whole tunnel or a whole room, and nothing else.
+##      * `PLANAR` — an axis-aligned box of voxels in front of you, while you
+##        are genuinely covered.
 ##
-## Cut blocks are either discarded outright (`opacity == 0`) or rendered as
-## ghosts that fade to nothing with distance from the player, the way distant
-## props fade in Don't Starve. `selectable` decides whether they can still be
-## mined.
+## Cut blocks are deleted, or drawn as ghosts that fade with distance.
 ## ---------------------------------------------------------------------------
 
 enum Mode { CYLINDER, FILL, PLANAR }
 
 const MODE_NAMES := ["Cylinder", "Fill", "Planar"]
 
-# ------------------------------------------------------------------- geometry
+## Camera forward per facing, matching CameraRig.FACINGS exactly.
+const FACING_FORWARD := [
+	Vector3i(0, 0, -1), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(1, 0, 0),
+]
+const FACING_LATERAL := [
+	Vector3i(1, 0, 0), Vector3i(0, 0, -1), Vector3i(-1, 0, 0), Vector3i(0, 0, 1),
+]
+
+# ------------------------------------------------------------------ quantised
+## The block the player is standing in. Everything anchors to this.
+var anchor := Vector3i.ZERO
+## The block the lens sits in.
+var cam_cell := Vector3i.ZERO
+## 0..3, the camera's settled facing.
+var facing := 0
+## Is the player actually behind something? Only planar cares.
+var occluded := false
+
+## Derived from the quantised state, and what the shader is given.
 var camera_position := Vector3.ZERO
 var target_position := Vector3.ZERO
+
+# ------------------------------------------------------------------- geometry
 var radius := 1.5
 var target_padding := 1.0
 var enabled := true
 var mode: int = Mode.CYLINDER
 
-## The shell of blocks around the player that survives whatever the mode says.
 var keep_radius := 2.75
-## How far toward the camera the shell stops protecting, as a cosine. Blocks
-## below and beside the player are kept; blocks on the lens side are not.
 var keep_bias := 0.35
 
-# ------------------------------------------------------------------- planar
-var planar_depth := 34.0
-var planar_half_width := 5.5
-var planar_below := 1.5
-var planar_above := 4.0
-## Set by the world each update: is the player actually behind something?
-var occluded := false
+# --------------------------------------------------------------------- planar
+## The slab, in whole blocks, measured from the player's own cell.
+var planar_depth := 34
+var planar_half_width := 5
+var planar_below := 1
+var planar_above := 4
 
-# --------------------------------------------------------------------- fill
-## Cut cells produced by the flood fill, as a dense byte mask over a box.
+# ----------------------------------------------------------------------- fill
 var fill_origin := Vector3i.ZERO
 var fill_size := Vector3i.ZERO
-## Stored in the same packed layout the shader samples — a grid of z-slices —
-## so the mask can be handed to the GPU with no repacking pass.
+## Packed as a grid of z-slices, the same layout the shader samples, so the mask
+## goes to the GPU without a repacking pass.
 var fill_mask := PackedByteArray()
-var fill_cols := 1                ## z-slices per row
-var fill_width := 0               ## fill_cols * fill_size.x
+var fill_cols := 1
+var fill_width := 0
+## Every marked cell, packed, so the cap builder can walk the set instead of the
+## volume that contains it.
+var fill_cells := PackedInt32Array()
+## True when the player is in open air and the fill found nothing to work with.
+var fill_empty := true
 
 # ------------------------------------------------------------- presentation
-## 0 discards cut blocks outright. Above 0 they are dithered ghosts at this
-## alpha next to the player, fading to nothing over `fade_distance`.
 var opacity := 0.0
 var fade_distance := 16.0
-## Can cut blocks still be aimed at and mined?
 var selectable := true
 
 
 func copy_from(o: Cutaway) -> void:
-	camera_position = o.camera_position
-	target_position = o.target_position
+	anchor = o.anchor
+	cam_cell = o.cam_cell
+	facing = o.facing
 	radius = o.radius
 	target_padding = o.target_padding
 	enabled = o.enabled
@@ -90,34 +104,69 @@ func copy_from(o: Cutaway) -> void:
 	opacity = o.opacity
 	fade_distance = o.fade_distance
 	selectable = o.selectable
+	refresh_points()
+
+
+## Snap to a camera and a player position. Returns true when the quantised state
+## actually changed, which is the only time anything downstream has work to do.
+func place(cam: Vector3, target: Vector3) -> bool:
+	var new_anchor := Vector3i(floori(target.x), floori(target.y), floori(target.z))
+	var new_cam := Vector3i(floori(cam.x), floori(cam.y), floori(cam.z))
+	var fwd := target - cam
+	fwd.y = 0.0
+	var new_facing := facing
+	if fwd.length_squared() > 0.01:
+		if absf(fwd.z) >= absf(fwd.x):
+			new_facing = 0 if fwd.z < 0.0 else 2
+		else:
+			new_facing = 1 if fwd.x < 0.0 else 3
+	if new_anchor == anchor and new_cam == cam_cell and new_facing == facing:
+		return false
+	anchor = new_anchor
+	cam_cell = new_cam
+	facing = new_facing
+	refresh_points()
+	return true
+
+
+func refresh_points() -> void:
+	# eye height inside the player's cell, so the drill lines up with the sprite
+	target_position = Vector3(anchor) + Vector3(0.5, 0.9, 0.5)
+	camera_position = Vector3(cam_cell) + Vector3(0.5, 0.5, 0.5)
+
+
+func toward_camera() -> Vector3i:
+	var f: Vector3i = FACING_FORWARD[facing]
+	return -f
+
+
+func lateral_axis() -> Vector3i:
+	var l: Vector3i = FACING_LATERAL[facing]
+	return l
 
 
 # =============================================================================
 # the predicate
 # =============================================================================
 
-## Must stay bit-for-bit in step with `is_cut()` in voxel.gdshader,
-## voxel_glass.gdshader and voxel_cross.gdshader.
+## Must stay bit-for-bit in step with `cut_is_cut()` in cutaway.gdshaderinc.
 func is_cut(bx: int, by: int, bz: int) -> bool:
 	if not enabled:
 		return false
+	if mode == Mode.PLANAR:
+		# The slab already only removes what lies toward the lens, so the keep
+		# shell has nothing left to protect — and leaving it out is what makes
+		# the cut a solid box, which is what makes the caps cheap.
+		return occluded and in_slab(bx, by, bz)
 	var bc := Vector3(bx + 0.5, by + 0.5, bz + 0.5)
 	if is_protected(bc):
 		return false
-	if in_cylinder(bc):
-		return true
-	match mode:
-		Mode.FILL:
-			return in_fill(bx, by, bz)
-		Mode.PLANAR:
-			return occluded and in_slab(bc)
-	return false
+	if mode == Mode.FILL and not fill_empty:
+		return in_fill(bx, by, bz)
+	return in_cylinder(bc)
 
 
-## The keep shell. A block within `keep_radius` of the player survives unless it
-## sits toward the lens, which is the only direction that can actually be in the
-## way. This is what keeps the ground under your feet and the block you are
-## about to mine from evaporating as you approach them.
+## The keep shell.
 func is_protected(bc: Vector3) -> bool:
 	var d := bc - target_position
 	var dist_sq := d.length_squared()
@@ -125,16 +174,14 @@ func is_protected(bc: Vector3) -> bool:
 		return false
 	if dist_sq < 0.0001:
 		return true
-	var toward_cam := camera_position - target_position
-	var len_sq := toward_cam.length_squared()
+	var toward := camera_position - target_position
+	var len_sq := toward.length_squared()
 	if len_sq < 0.0001:
 		return true
-	# normalised dot: how much of this block lies in the lens direction
-	return d.dot(toward_cam) / sqrt(dist_sq * len_sq) < keep_bias
+	return d.dot(toward) / sqrt(dist_sq * len_sq) < keep_bias
 
 
-## The drill from the lens to the player: a cylinder around the segment with a
-## spherical cap at the player end so you stay visible pressed against a wall.
+## The drill from the lens to the player.
 func in_cylinder(bc: Vector3) -> bool:
 	var seg := target_position - camera_position
 	var rel := bc - camera_position
@@ -142,22 +189,19 @@ func in_cylinder(bc: Vector3) -> bool:
 	if len_sq < 0.001:
 		var rr := radius + target_padding
 		return rel.length_squared() <= rr * rr
-	# t = 0 at the lens, t = 1 at the player
 	var t := rel.dot(seg) / len_sq
 	var closest: Vector3
 	var er := radius
 	if t <= 0.0:
-		closest = camera_position          # behind the lens
+		closest = camera_position
 	elif t >= 1.0:
-		closest = target_position          # past the player: widen the cap
+		closest = target_position
 		er += target_padding
 	else:
 		closest = camera_position + seg * t
 	return bc.distance_squared_to(closest) <= er * er
 
 
-## The flood-filled pocket and its shadow toward the lens. The mask is built by
-## `VoxelWorld._rebuild_fill()`; this only reads it.
 func in_fill(bx: int, by: int, bz: int) -> bool:
 	if fill_mask.is_empty():
 		return false
@@ -178,32 +222,43 @@ func packed_index(lx: int, ly: int, lz: int) -> int:
 	return (row * fill_size.y + ly) * fill_width + (col * fill_size.x + lx)
 
 
-## A slab of voxel coordinates directly in front of the player, measured along
-## the camera's own axis. Only live while the player is occluded, so an open
-## landscape is never sliced for no reason.
-func in_slab(bc: Vector3) -> bool:
-	var axis := camera_position - target_position
-	axis.y = 0.0
-	if axis.length_squared() < 0.0001:
+## An axis-aligned box of whole blocks in front of the player. Pure integer
+## arithmetic — no square roots, no normalising, no per-cell vector maths.
+func in_slab(bx: int, by: int, bz: int) -> bool:
+	var t := toward_camera()
+	var l := lateral_axis()
+	var dx := bx - anchor.x
+	var dy := by - anchor.y
+	var dz := bz - anchor.z
+	var toward := dx * t.x + dz * t.z
+	if toward < 1 or toward > planar_depth:
 		return false
-	axis = axis.normalized()
-	var d := bc - target_position
-	var toward := d.dot(axis)             # positive = toward the lens
-	if toward < 0.5 or toward > planar_depth:
+	var lat := dx * l.x + dz * l.z
+	if lat < -planar_half_width or lat > planar_half_width:
 		return false
-	var lateral := Vector3(-axis.z, 0.0, axis.x)
-	if absf(d.dot(lateral)) > planar_half_width:
-		return false
-	return d.y >= -planar_below and d.y <= planar_above
+	return dy >= -planar_below and dy <= planar_above
+
+
+## The slab as an integer AABB, which is all the cap builder needs.
+func slab_bounds() -> AABB:
+	var t := toward_camera()
+	var l := lateral_axis()
+	var lo := anchor
+	var hi := anchor
+	for corner_t: int in [1, planar_depth]:
+		for corner_l: int in [-planar_half_width, planar_half_width]:
+			var c := anchor + t * corner_t + l * corner_l
+			lo = Vector3i(mini(lo.x, c.x), lo.y, mini(lo.z, c.z))
+			hi = Vector3i(maxi(hi.x, c.x), hi.y, maxi(hi.z, c.z))
+	lo.y = anchor.y - planar_below
+	hi.y = anchor.y + planar_above
+	return AABB(Vector3(lo), Vector3(hi - lo + Vector3i.ONE))
 
 
 # =============================================================================
 # presentation
 # =============================================================================
 
-## Ghost alpha for a cut block, 0 when it should be discarded outright. The
-## falloff is from the player, not the camera, so the world opens up around you
-## and closes again in the distance.
 func ghost_alpha(bc: Vector3) -> float:
 	if opacity <= 0.0:
 		return 0.0
@@ -211,9 +266,6 @@ func ghost_alpha(bc: Vector3) -> float:
 	return clampf(opacity * (1.0 - d / maxf(fade_distance, 0.001)), 0.0, 1.0)
 
 
-## Can the player aim through the cut in the primary raycast pass? Only when the
-## ghosts are actually visible — otherwise you would be mining an invisible
-## hillside instead of the ground you can see behind it.
 func selectable_in_primary() -> bool:
 	return selectable and opacity > 0.0
 
@@ -226,24 +278,23 @@ func mode_name() -> String:
 # bookkeeping
 # =============================================================================
 
-## The integer bounding box the cap builder has to scan. Cylinder and planar are
-## analytic; fill hands back the box its mask already covers.
+## Everything the cut set depends on, in one comparable value. While this has
+## not changed, neither has the cross-section, and the cached mesh stands.
+func signature(world_version: int) -> String:
+	return "%d|%d,%d,%d|%d,%d,%d|%d|%d|%d|%d|%d" % [
+		mode, anchor.x, anchor.y, anchor.z, cam_cell.x, cam_cell.y, cam_cell.z,
+		facing, int(occluded), int(enabled), int(opacity > 0.0), world_version]
+
+
 func get_int_bounds() -> AABB:
+	if mode == Mode.PLANAR:
+		return slab_bounds()
 	var pad := radius + target_padding + keep_radius
 	var min_pos := camera_position.min(target_position) - Vector3(pad, pad, pad)
 	var max_pos := camera_position.max(target_position) + Vector3(pad, pad, pad)
 	if mode == Mode.FILL and fill_size.x > 0:
 		min_pos = min_pos.min(Vector3(fill_origin))
 		max_pos = max_pos.max(Vector3(fill_origin + fill_size))
-	if mode == Mode.PLANAR and occluded:
-		var axis := camera_position - target_position
-		axis.y = 0.0
-		if axis.length_squared() > 0.0001:
-			axis = axis.normalized()
-			var far := target_position + axis * planar_depth
-			var w := Vector3(planar_half_width, 0, planar_half_width)
-			min_pos = min_pos.min(far - w - Vector3(0, planar_below, 0))
-			max_pos = max_pos.max(far + w + Vector3(0, planar_above, 0))
 	var min_i := Vector3i(floori(min_pos.x), floori(min_pos.y), floori(min_pos.z))
 	var max_i := Vector3i(ceili(max_pos.x), ceili(max_pos.y), ceili(max_pos.z))
 	return AABB(min_i, max_i - min_i)
@@ -251,15 +302,20 @@ func get_int_bounds() -> AABB:
 
 func clear_fill() -> void:
 	fill_mask = PackedByteArray()
+	fill_cells = PackedInt32Array()
 	fill_size = Vector3i.ZERO
 	fill_origin = Vector3i.ZERO
 	fill_cols = 1
 	fill_width = 0
+	fill_empty = true
 
 
 func push_to_shader_globals() -> void:
 	RenderingServer.global_shader_parameter_set(&"cut_cam_pos", camera_position)
 	RenderingServer.global_shader_parameter_set(&"cut_target_pos", target_position)
+	RenderingServer.global_shader_parameter_set(&"cut_anchor", Vector3(anchor))
+	RenderingServer.global_shader_parameter_set(&"cut_toward", Vector3(toward_camera()))
+	RenderingServer.global_shader_parameter_set(&"cut_lateral", Vector3(lateral_axis()))
 	RenderingServer.global_shader_parameter_set(&"cut_radius", float(radius))
 	RenderingServer.global_shader_parameter_set(&"cut_target_padding", float(target_padding))
 	RenderingServer.global_shader_parameter_set(&"cut_enabled", 1.0 if enabled else 0.0)
@@ -273,6 +329,7 @@ func push_to_shader_globals() -> void:
 	RenderingServer.global_shader_parameter_set(&"cut_planar_below", float(planar_below))
 	RenderingServer.global_shader_parameter_set(&"cut_planar_above", float(planar_above))
 	RenderingServer.global_shader_parameter_set(&"cut_occluded", 1.0 if occluded else 0.0)
+	RenderingServer.global_shader_parameter_set(&"cut_fill_empty", 1.0 if fill_empty else 0.0)
 
 
 func save_state() -> Dictionary:

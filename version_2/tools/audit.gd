@@ -31,4 +31,39 @@ func _init() -> void:
 	print("effects:      %d" % EffectLib.defs.size())
 	print("techs:        %d" % TechCatalog.ALL.size())
 	print("crops:        %d" % CropTable.all().size())
+
+	# --- taming. Every creature must be tameable and every food it wants must
+	# be an item that exists, or a profile is a dead end the player cannot see.
+	TameDB.boot()
+	var untameable: Array[String] = []
+	var dangling: Array[String] = []
+	var knockouts := 0
+	for d: SpeciesDB.Def in SpeciesDB.defs:
+		var p: TameDB.Profile = TameDB.get_profile(d.id)
+		if p == null:
+			untameable.append(String(d.id))
+			continue
+		if p.method != TameDB.METHOD_PASSIVE:
+			knockouts += 1
+		if p.foods.is_empty():
+			dangling.append("%s has nothing it will eat" % d.id)
+		for f: Array in p.foods:
+			if not Items.has(StringName(f[0])):
+				dangling.append("%s wants missing item '%s'" % [d.id, f[0]])
+		for c: StringName in p.conditions:
+			if not TameDB.COND_TEXT.has(c):
+				dangling.append("%s needs unknown condition '%s'" % [d.id, c])
+	for f: StringName in TameDB.UNIVERSAL_FOOD:
+		if not Items.has(f):
+			dangling.append("universal feed '%s' does not exist" % f)
+	print("taming:       %d profiles (%d knockout or harder)" % [
+		TameDB.profiles.size(), knockouts])
+	if not untameable.is_empty():
+		printerr("no taming profile for: %s" % ", ".join(untameable))
+		fail += 1
+	if not dangling.is_empty():
+		for line: String in dangling:
+			printerr("taming: %s" % line)
+		fail += 1
+
 	quit(1 if fail > 0 else 0)

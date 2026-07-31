@@ -13,6 +13,8 @@ var world: VoxelWorld
 var game: Node
 var kind: StringName = &"bullet"
 var damage := 10.0
+## Sedative carried by the round, delivered separately from the damage.
+var torpor := 0.0
 var element: StringName = Blocks.ELEM_PHYSICAL
 var source: Node = null
 var hostile := false           ## true when fired by a monster at the player
@@ -29,12 +31,13 @@ var _light: OmniLight3D
 
 static func fire(parent: Node, w: VoxelWorld, g: Node, kind_id: StringName,
 		from: Vector3, dir: Vector3, dmg: float, elem: StringName,
-		src: Node, is_hostile := false) -> Projectile:
+		src: Node, is_hostile := false, tor := 0.0) -> Projectile:
 	var p := Projectile.new()
 	p.world = w
 	p.game = g
 	p.kind = kind_id
 	p.damage = dmg
+	p.torpor = tor
 	p.element = elem
 	p.source = src
 	p.hostile = is_hostile
@@ -165,6 +168,8 @@ func _check_bodies() -> void:
 			continue
 		_hit.append(id)
 		m.hurt(damage, element, velocity.normalized() * 4.0, source)
+		if torpor > 0.0:
+			m.apply_torpor(torpor)
 		if game != null:
 			game.on_element_applied(m, element)
 		_pierced += 1

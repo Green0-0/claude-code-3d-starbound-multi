@@ -56,7 +56,7 @@ const HELP_TEXT := """VOXELBOUND
 WASD    move (relative to the camera)      LMB   mine (hold)
 Space   jump — auto-steps single blocks     RMB   place / use held item
 Shift   sprint (burns energy)               F     swing at what you are aiming at
-Ctrl    crouch · climb down ladders         R     interact (talk, open, sit)
+Ctrl    crouch · climb down ladders         R     interact (talk, open, feed)
 Q / E   rotate the world 90°                G     activate equipped tech
 Wheel   zoom · Ctrl+Wheel change slot       X     drop the held stack
 1-9     hotbar slot                         V     toggle the cutaway system
@@ -66,7 +66,13 @@ F5      quick save     F1 this panel   Esc close / quit
 
 The camera cannot be blocked: anything between the lens and you is sliced away,
 and the exposed cross-section is rebuilt as real geometry. Turning the camera is
-a real action — some weapons, techs and creatures only work through the cut."""
+a real action — some weapons, techs and creatures only work through the cut.
+
+TAMING. Hold food and press R at a creature. The calm ones can simply be won
+over; the rest have to be knocked out with something that deals torpor and then
+fed while they sleep. Every hit they take while under costs you quality, and
+the torpor drains the whole time — carry narcotics. Empty-handed R on a tame
+opens its sheet: what it will learn, and what it is carrying."""
 
 
 func _ready() -> void:
@@ -351,9 +357,28 @@ func _sync_info() -> void:
 	if game != null:
 		extra = "\n%s  day %d  %s   fuel %d" % [
 			_planet_name(), game.sky.day, game.sky.time_string(), game.ship_fuel]
+		extra += _creature_line()
 	info_label.text = "%d FPS   x %d  y %d  z %d\nview: %s   camera: %s%s" % [
 		Engine.get_frames_per_second(), b.x, b.y, b.z,
 		cut_state, rig.facing_name(), extra]
+
+
+## One line about whatever creature you are standing next to. Taming is the one
+## system where the state you need — torpor, how much it has eaten, what
+## condition is still unmet — is invisible on the sprite, so it goes here.
+func _creature_line() -> String:
+	var m: Monster = game.creature_in_reach(player, 4.5)
+	if m == null:
+		return "\nhandling %d" % player.handling_skill()
+	var line := "\n%s — %s" % [m.nickname(), m.status_line()]
+	if not m.tamed:
+		var unmet := m.unmet_conditions()
+		if not unmet.is_empty():
+			var bits: Array[String] = []
+			for c: StringName in unmet:
+				bits.append(String(TameDB.COND_TEXT.get(c, String(c))))
+			line += "  (needs: %s)" % ", ".join(bits)
+	return line + "   handling %d" % player.handling_skill()
 
 
 func _planet_name() -> String:

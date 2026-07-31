@@ -19,6 +19,7 @@ static func register_all() -> void:
 	_armor()
 	_food()
 	_tech()
+	_taming()
 
 
 static func r(id: String, station: StringName) -> Crafting.Recipe:
@@ -582,3 +583,71 @@ static func _tech() -> void:
 			rec.takes(&"advanced_circuit", 2)
 		if price >= 3000:
 			rec.takes(&"quantum_processor", 1)
+
+
+# ================================================================= taming ====
+## The handler's kit. Deliberately cheap at the bottom — a sap club and a bola
+## cost a morning's foraging — and expensive at the top, because a dart rifle
+## and concentrated narcotic are what stand between you and the exotics.
+static func _taming() -> void:
+	r("sap_club", &"hand").takes(&"wood_log", 1).takes(&"stick", 2) \
+		.takes(&"plant_fibre", 3).gives(&"sap_club", 1).in_category(&"weapons") \
+		.describe("A weighted club that puts creatures out rather than down.") \
+		.known_at_start()
+
+	r("bola", &"hand").takes(&"plant_fibre", 3).takes(&"stone", 3) \
+		.gives(&"bola", 2).in_category(&"tools") \
+		.describe("Three stones and a cord.").known_at_start()
+
+	r("capture_net", &"workbench").takes(&"plant_fibre", 8).takes(&"stick", 4) \
+		.takes(&"leather", 2).gives(&"capture_net", 1).at_tier(1) \
+		.in_category(&"tools").learned_from_material(&"leather")
+
+	r("creature_feed", &"workbench").takes(&"wheat", 2).takes(&"raw_meat", 1) \
+		.gives(&"creature_feed", 6).in_category(&"food") \
+		.describe("A sack of the stuff every creature will eat.").known_at_start()
+
+	r("kibble", &"kitchen").takes(&"egg", 1).takes(&"carrot", 2) \
+		.takes(&"cooked_meat", 1).gives(&"kibble", 4).at_tier(1) \
+		.in_category(&"food") \
+		.describe("Halves the work of any tame.").learned_from_material(&"egg")
+
+	r("tranq_arrow", &"workbench").takes(&"arrow", 4).takes(&"venom_gland", 1) \
+		.takes(&"plant_matter", 2).gives(&"tranq_arrow", 4).at_tier(1) \
+		.in_category(&"ammo").learned_from_material(&"venom_gland")
+
+	r("tranq_bow", &"workbench").takes(&"stick", 4).takes(&"plant_fibre", 6) \
+		.takes(&"leather", 2).gives(&"tranq_bow", 1).at_tier(1) \
+		.in_category(&"weapons").learned_from_material(&"leather")
+
+	r("narcotic", &"chemistry").takes(&"venom_gland", 1).takes(&"plant_matter", 4) \
+		.takes(&"empty_flask", 1).gives(&"narcotic", 3).at_tier(2) \
+		.in_category(&"medical").learned_from_material(&"venom_gland")
+
+	r("stimulant", &"chemistry").takes(&"glow_gland", 1).takes(&"empty_flask", 1) \
+		.takes(&"plant_matter", 2).gives(&"stimulant", 3).at_tier(2) \
+		.in_category(&"medical").learned_from_material(&"glow_gland")
+
+	r("strong_narcotic", &"chemistry").takes(&"narcotic", 4) \
+		.takes(&"crystal_shard", 2).takes(&"empty_flask", 1) \
+		.gives(&"strong_narcotic", 1).at_tier(3).in_category(&"medical")
+
+	r("tranq_dart", &"anvil").takes(&"iron_bar", 1).takes(&"narcotic", 1) \
+		.gives(&"tranq_dart", 8).at_tier(2).in_category(&"ammo") \
+		.learned_from_material(&"narcotic")
+
+	r("shock_dart", &"assembler").takes(&"tranq_dart", 4).takes(&"battery", 1) \
+		.takes(&"copper_wire", 2).gives(&"shock_dart", 4).at_tier(3) \
+		.in_category(&"ammo")
+
+	r("tranq_rifle", &"assembler").takes(&"iron_bar", 4).takes(&"copper_wire", 4) \
+		.takes(&"circuit_board", 1).takes(&"leather", 2).gives(&"tranq_rifle", 1) \
+		.at_tier(3).in_category(&"weapons")
+
+	r("handlers_collar", &"workbench").takes(&"leather", 3).takes(&"copper_bar", 1) \
+		.takes(&"plant_fibre", 4).gives(&"handlers_collar", 1).at_tier(2) \
+		.in_category(&"tools").learned_from_material(&"leather")
+
+	r("saddlebag", &"workbench").takes(&"leather", 5).takes(&"cloth", 3) \
+		.takes(&"plant_fibre", 6).gives(&"saddlebag", 1).at_tier(2) \
+		.in_category(&"tools")

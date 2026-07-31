@@ -92,10 +92,17 @@ var _cap_dirty := true
 ## player crosses a block boundary or the camera swings — not every frame the
 ## way the caps are.
 var _fill_dirty := true
-var _fill_anchor := Vector3i(9999, 9999, 9999)
-var _fill_cam := Vector3i(9999, 9999, 9999)
 var _fill_img: Image
 var _fill_tex: ImageTexture
+## Bumped by every block write. Part of the cut signature, so mining inside a
+## cross-section rebuilds it on the same frame instead of leaving the old
+## geometry hanging in the air.
+var _world_version := 0
+## The signature the cached cap mesh was built for.
+var _cut_sig := ""
+## How many times the cross-section has actually been rebuilt. Standing still
+## must not increment this.
+var cut_rebuilds := 0
 
 ## Terrain, biomes, ores and structures all live in the generator, so a planet
 ## is a configuration rather than a code path.
@@ -262,6 +269,7 @@ func set_block(gx: int, gy: int, gz: int, id: int, mark_dirty := true) -> bool:
 			c.coll[ci] |= bit
 		else:
 			c.coll[ci] &= ~bit
+	_world_version += 1
 	if mark_dirty:
 		_touch(key)
 		if lx == 0:
@@ -347,21 +355,18 @@ func _process(_delta: float) -> void:
 			_initial_done = true
 			world_ready.emit()
 
-	# The fill is the expensive one, so it is rebuilt on block-boundary crossings
-	# rather than per frame — and in fill mode the caps ride along with it,
-	# because re-walking a mask of thousands of cells every frame would cost far
-	# more than the sub-block lag is worth.
-	var fill_rebuilt := false
-	if cutaway.mode == Cutaway.Mode.FILL and cutaway.enabled and _fill_dirty:
+	# One signature governs the whole cut. While it holds, the cross-section is
+	# unchanged and there is nothing at all to do — which is the point of
+	# quantising the predicate to voxel coordinates in the first place.
+	var sig := cutaway.signature(_world_version)
+	if sig != _cut_sig:
+		_cut_sig = sig
+		cut_rebuilds += 1
+		if cutaway.enabled and cutaway.mode == Cutaway.Mode.FILL:
+			_rebuild_fill()
+		_rebuild_caps()
 		_fill_dirty = false
-		_rebuild_fill()
-		fill_rebuilt = true
-		_cap_dirty = true
-
-	if _cap_dirty:
-		if cutaway.mode != Cutaway.Mode.FILL or fill_rebuilt or not cutaway.enabled:
-			_cap_dirty = false
-			_rebuild_caps()
+		_cap_dirty = false
 
 
 ## A chunk can only be meshed once its 8 neighbours exist, otherwise we would
@@ -1314,28 +1319,19 @@ func _faces_to_arrays(fpos: PackedInt32Array, fmeta: PackedInt32Array) -> Array:
 # cutaway cross-section caps
 # =============================================================================
 
+## Called every frame. Almost every call is a no-op: the cut is anchored to
+## whole voxels, so nothing happens until the player crosses a block boundary or
+## the camera settles on a new facing.
 func update_cutaway(cam_pos: Vector3, target_pos: Vector3) -> void:
-	if cutaway.camera_position.is_equal_approx(cam_pos) \
-			and cutaway.target_position.is_equal_approx(target_pos):
+	var moved := cutaway.place(cam_pos, target_pos)
+	if not moved:
 		return
-	cutaway.camera_position = cam_pos
-	cutaway.target_position = target_pos
-	_cap_dirty = true
-
-	# The planar slab only exists while something is genuinely in the way, so
-	# an open landscape is never sliced for no reason.
+	# Only planar needs to know whether the view is blocked, and only so it can
+	# stay dormant in the open. One raycast per block crossing, not per frame.
 	if cutaway.mode == Cutaway.Mode.PLANAR:
-		var was := cutaway.occluded
 		cutaway.occluded = _is_occluded(cam_pos, target_pos)
-		if was != cutaway.occluded:
-			_cap_dirty = true
-
-	var anchor := Vector3i(floori(target_pos.x), floori(target_pos.y), floori(target_pos.z))
-	var cam_cell := Vector3i(floori(cam_pos.x), floori(cam_pos.y), floori(cam_pos.z))
-	if anchor != _fill_anchor or (cam_cell - _fill_cam).length_squared() > 9:
-		_fill_anchor = anchor
-		_fill_cam = cam_cell
-		_fill_dirty = true
+	_fill_dirty = true
+	_cap_dirty = true
 
 
 func set_cutaway_mode(m: int) -> void:
@@ -1343,8 +1339,9 @@ func set_cutaway_mode(m: int) -> void:
 		return
 	cutaway.mode = m
 	cutaway.clear_fill()
-	_fill_dirty = true
-	_cap_dirty = true
+	if m == Cutaway.Mode.PLANAR:
+		cutaway.occluded = _is_occluded(cutaway.camera_position, cutaway.target_position)
+	_cut_sig = ""
 
 
 ## Is the straight line from the lens to the player actually blocked? Only the
@@ -1362,15 +1359,14 @@ func set_cutaway_enabled(v: bool) -> void:
 	if cutaway.enabled == v:
 		return
 	cutaway.enabled = v
-	_fill_dirty = true
-	_cap_dirty = true
+	_cut_sig = ""
 
 
 ## Ghost opacity and the mine-through toggle. Both are pure presentation, but
 ## the caps change with them, so they go through here.
 func set_cutaway_opacity(v: float) -> void:
 	cutaway.opacity = clampf(v, 0.0, 1.0)
-	_cap_dirty = true
+	_cut_sig = ""
 
 
 func set_cutaway_selectable(v: bool) -> void:
@@ -1400,12 +1396,20 @@ static func dir_index(v: Vector3i) -> int:
 # the flood-filled cut volume
 # =============================================================================
 
-## Build the FILL mode's cut set: the air pocket the player is standing in, plus
-## everything between that whole pocket and the lens, plus the ordinary
-## cylinder. Packed straight into the z-slice grid the shader samples, so there
-## is no repacking pass between here and the GPU.
+## Build the FILL mode's cut set.
+##
+## Flood the enclosed air pocket the player is standing in, then remove whatever
+## occludes it. The result reveals one interconnected space — a tunnel, a
+## gallery, a house — in its entirety, and touches nothing outside it. There is
+## no cylinder mixed in: if you are standing in a room, the room is what you
+## want to see, not a cone bored through the hill behind it.
+##
+## The flood only travels through *covered* air, which is what stops a doorway
+## leaking it into the open sky. Standing outdoors there is no pocket at all,
+## and the mode falls back to the drill so you are never left blind.
 func _rebuild_fill() -> void:
 	var cut := cutaway
+	cut.clear_fill()
 	var target := cut.target_position
 	var cam := cut.camera_position
 
@@ -1429,18 +1433,17 @@ func _rebuild_fill() -> void:
 	cut.fill_width = width
 	cut.fill_mask = mask
 
-	var marked := PackedInt32Array()
-
-	# --- 1. the pocket. Seeded at the player, who is by definition standing in
-	# it, and again where the sightline first breaks into open air, so a player
-	# wedged into a crevice still lights up the room they are looking into.
+	# --- 1. the pocket
+	var pocket := PackedInt32Array()
 	var queue: Array[Vector3i] = []
-	var start := Vector3i(floori(target.x), floori(target.y + 0.9), floori(target.z))
+	var start := Vector3i(floori(target.x), floori(target.y), floori(target.z))
 	if is_covered(start.x, start.y, start.z):
-		_seed_fill(start, queue, marked)
+		_seed_fill(start, queue, pocket)
+	# and where the sightline first breaks into open air, so a player wedged in a
+	# crevice still lights up the room they are looking into
 	var breach := _first_air_toward(cam, target)
 	if breach.y >= 0 and is_covered(breach.x, breach.y, breach.z):
-		_seed_fill(breach, queue, marked)
+		_seed_fill(breach, queue, pocket)
 
 	var filled := 0
 	var head := 0
@@ -1453,23 +1456,39 @@ func _rebuild_fill() -> void:
 			var n := c + d
 			if is_solid_at(n.x, n.y, n.z) or not is_covered(n.x, n.y, n.z):
 				continue
-			_seed_fill(n, queue, marked)
+			_seed_fill(n, queue, pocket)
 
-	# --- 2. the shadow: from every cell of the pocket, march to the lens.
-	# Marching stops the moment it meets a cell some other ray already marked —
-	# the camera is far enough away that those rays are near-parallel, so the
-	# suffix is already done and re-walking it would only cost time.
-	var pocket := marked.duplicate()
+	if pocket.is_empty():
+		# no enclosed space: leave the mask empty and let the drill take over
+		cut.clear_fill()
+		_upload_fill(1, 1)
+		return
+	cut.fill_empty = false
+
+	# --- 2. what occludes it. Only the pocket's silhouette needs to march: a
+	# cell whose neighbour toward the lens is also pocket is already covered by
+	# that neighbour's ray, so marching from it would retrace the same line.
+	var step := _camera_step(cam, target)
+	var marked := pocket.duplicate()
 	for i in pocket.size():
+		var c: Vector3i = _unpack(pocket[i])
+		var ahead := c + step
+		if cut.in_fill(ahead.x, ahead.y, ahead.z):
+			continue
 		if marked.size() > MAX_MARKED_CELLS:
 			break
-		_shadow_toward_camera(_unpack(pocket[i]), cam, marked)
+		_shadow_toward_camera(c, cam, marked)
 
-	# --- 3. the ordinary cylinder, so the mask is the whole cut set and the cap
-	# builder can iterate it instead of scanning a volume.
-	_mark_cylinder(marked)
-
+	cut.fill_cells = marked
 	_upload_fill(width, height)
+
+
+## The whole-block step from a cell toward the lens, used to walk the shadow.
+func _camera_step(cam: Vector3, target: Vector3) -> Vector3i:
+	var d := cam - target
+	if absf(d.x) >= absf(d.z):
+		return Vector3i(1 if d.x > 0.0 else -1, 0, 0)
+	return Vector3i(0, 0, 1 if d.z > 0.0 else -1)
 
 
 ## Mark one cell if it is inside the box and not already marked.
@@ -1508,6 +1527,11 @@ func _unpack(i: int) -> Vector3i:
 
 
 ## March from a pocket cell to the lens, marking whatever is in the way.
+##
+## Stops the moment it meets a cell some *other* ray already marked: the lens is
+## far enough away that the rays are near-parallel, so the rest of that path is
+## already done. It must not stop on a cell this same ray wrote a moment ago,
+## which is what happens if you sample finer than one block and do not say so.
 func _shadow_toward_camera(from: Vector3i, cam: Vector3, marked: PackedInt32Array) -> void:
 	var p := Vector3(from) + Vector3(0.5, 0.5, 0.5)
 	var dir := cam - p
@@ -1515,11 +1539,15 @@ func _shadow_toward_camera(from: Vector3i, cam: Vector3, marked: PackedInt32Arra
 	if dist < 0.001:
 		return
 	dir /= dist
-	var steps := mini(int(dist / 0.6), MAX_SHADOW_STEPS)
+	var steps := mini(int(dist / 0.5), MAX_SHADOW_STEPS)
 	var cut := cutaway
+	var last := from
 	for i in range(1, steps + 1):
-		var w := p + dir * (float(i) * 0.6)
+		var w := p + dir * (float(i) * 0.5)
 		var c := Vector3i(floori(w.x), floori(w.y), floori(w.z))
+		if c == last:
+			continue                    # same cell, finer sampling; not a collision
+		last = c
 		var lx := c.x - cut.fill_origin.x
 		var ly := c.y - cut.fill_origin.y
 		var lz := c.z - cut.fill_origin.z
@@ -1529,23 +1557,9 @@ func _shadow_toward_camera(from: Vector3i, cam: Vector3, marked: PackedInt32Arra
 			return
 		var idx := cut.packed_index(lx, ly, lz)
 		if cut.fill_mask[idx] != 0:
-			return                      # already walked from here to the lens
+			return                      # another ray already walked this to the lens
 		cut.fill_mask[idx] = 1
 		marked.append(_pack(c))
-
-
-func _mark_cylinder(marked: PackedInt32Array) -> void:
-	var cut := cutaway
-	var scratch: Array[Vector3i] = []
-	var pad := cut.radius + cut.target_padding
-	var lo := cut.camera_position.min(cut.target_position) - Vector3(pad, pad, pad)
-	var hi := cut.camera_position.max(cut.target_position) + Vector3(pad, pad, pad)
-	for x in range(floori(lo.x), ceili(hi.x)):
-		for y in range(maxi(floori(lo.y), 0), mini(ceili(hi.y), WH)):
-			for z in range(floori(lo.z), ceili(hi.z)):
-				if not cut.in_cylinder(Vector3(x + 0.5, y + 0.5, z + 0.5)):
-					continue
-				_seed_fill(Vector3i(x, y, z), scratch, marked, false)
 
 
 ## Is there anything solid above this cell? The flood fill only travels through
@@ -1583,6 +1597,10 @@ func _first_air_toward(cam: Vector3, target: Vector3) -> Vector3i:
 ## the upload is a straight memcpy of the array we already built.
 func _upload_fill(width: int, height: int) -> void:
 	var cut := cutaway
+	# The empty case is real: outdoors there is no pocket at all, and a 1x1
+	# texture still needs its one byte or the image constructor refuses it.
+	if cut.fill_mask.size() < width * height:
+		cut.fill_mask.resize(width * height)
 	if _fill_img == null or _fill_img.get_width() != width \
 			or _fill_img.get_height() != height:
 		_fill_img = Image.create_from_data(width, height, false, Image.FORMAT_R8,
@@ -1612,10 +1630,11 @@ func _rebuild_caps() -> void:
 		return
 
 	var caps: Array = []
-	# FILL already holds its whole cut set as a dense mask, so walking that is
-	# strictly cheaper than rescanning the volume it came from.
-	if cut.mode == Cutaway.Mode.FILL and not cut.fill_mask.is_empty():
-		_caps_from_mask(caps)
+	if cut.mode == Cutaway.Mode.PLANAR:
+		if cut.occluded:
+			_caps_from_slab(caps)
+	elif cut.mode == Cutaway.Mode.FILL and not cut.fill_cells.is_empty():
+		_caps_from_cells(caps)
 	else:
 		_caps_from_bounds(caps)
 
@@ -1627,6 +1646,59 @@ func _rebuild_caps() -> void:
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _cap_arrays(caps))
 	mesh.surface_set_material(0, mat_cap)
 	_cap_mi.mesh = mesh
+
+
+## The planar slab is a solid axis-aligned box of voxels, so the only cut cells
+## with an uncut neighbour are the ones on its boundary. Walking the five
+## outward faces is O(surface) instead of O(volume) — for the default slab that
+## is about 1,200 cells rather than 25,000, and it only happens when the box
+## itself moves.
+func _caps_from_slab(caps: Array) -> void:
+	var cut := cutaway
+	var cam := cut.camera_position
+	var t := cut.toward_camera()
+	var l := cut.lateral_axis()
+	var w := cut.planar_half_width
+	var d0 := 1
+	var d1 := cut.planar_depth
+	var y0 := cut.anchor.y - cut.planar_below
+	var y1 := cut.anchor.y + cut.planar_above
+
+	# the two depth end-caps: nearest to the player, and the far wall
+	for lat: int in range(-w, w + 1):
+		for y: int in range(maxi(y0, 0), mini(y1 + 1, WH)):
+			_cap_boundary(caps, cut.anchor + t * d0 + l * lat + Vector3i(0, y - cut.anchor.y, 0),
+				-t, cam)
+			_cap_boundary(caps, cut.anchor + t * d1 + l * lat + Vector3i(0, y - cut.anchor.y, 0),
+				t, cam)
+
+	# the two lateral walls
+	for depth: int in range(d0, d1 + 1):
+		for y: int in range(maxi(y0, 0), mini(y1 + 1, WH)):
+			var dy := Vector3i(0, y - cut.anchor.y, 0)
+			_cap_boundary(caps, cut.anchor + t * depth + l * -w + dy, -l, cam)
+			_cap_boundary(caps, cut.anchor + t * depth + l * w + dy, l, cam)
+
+	# floor and ceiling
+	for depth: int in range(d0, d1 + 1):
+		for lat: int in range(-w, w + 1):
+			var base := cut.anchor + t * depth + l * lat
+			if y0 - 1 >= 0:
+				_cap_boundary(caps, Vector3i(base.x, y0, base.z), Vector3i(0, -1, 0), cam)
+			if y1 + 1 < WH:
+				_cap_boundary(caps, Vector3i(base.x, y1, base.z), Vector3i(0, 1, 0), cam)
+
+
+## One boundary cell of a box cut: if the neighbour just outside is solid, that
+## neighbour has a newly exposed face.
+func _cap_boundary(caps: Array, cell: Vector3i, outward: Vector3i, cam: Vector3) -> void:
+	var n := cell + outward
+	if n.y < 0 or n.y >= WH:
+		return
+	var id := get_block(n.x, n.y, n.z)
+	if id == Blocks.AIR or not Blocks.is_opaque(id):
+		return
+	_cap_face(caps, n, dir_index(-outward), Vector3(cell).distance_to(cam))
 
 
 func _caps_from_bounds(caps: Array) -> void:
@@ -1654,25 +1726,16 @@ func _caps_from_bounds(caps: Array) -> void:
 				_cap_neighbours(caps, x, y, z, cam)
 
 
-func _caps_from_mask(caps: Array) -> void:
+## The fill already produced its cut set as a list, so walking that is strictly
+## cheaper than rescanning the box that contains it.
+func _caps_from_cells(caps: Array) -> void:
 	var cut := cutaway
 	var cam := cut.camera_position
-	var size := cut.fill_size
-	var origin := cut.fill_origin
-	var mask := cut.fill_mask
-	for lz in size.z:
-		for ly in size.y:
-			var base := cut.packed_index(0, ly, lz)
-			for lx in size.x:
-				if mask[base + lx] == 0:
-					continue
-				var x := origin.x + lx
-				var y := origin.y + ly
-				var z := origin.z + lz
-				# the keep shell is evaluated per frame, not baked into the mask
-				if cut.is_protected(Vector3(x + 0.5, y + 0.5, z + 0.5)):
-					continue
-				_cap_neighbours(caps, x, y, z, cam)
+	for i in cut.fill_cells.size():
+		var c: Vector3i = _unpack(cut.fill_cells[i])
+		if cut.is_protected(Vector3(c) + Vector3(0.5, 0.5, 0.5)):
+			continue
+		_cap_neighbours(caps, c.x, c.y, c.z, cam)
 
 
 ## Emit the faces the discard just exposed around one cut cell.

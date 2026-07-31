@@ -33,6 +33,7 @@ var _craft_station: Crafting.Station = null
 var _craft_object: PlacedObject = null
 var _craft_filter: StringName = &""
 var _container: PlacedObject = null
+var _creature: Monster = null
 var _npc: Npc = null
 var _shop_mode := false
 var _selected_quest := ""
@@ -264,6 +265,7 @@ func open(name: StringName, force := false) -> void:
 		&"tech": _build_tech()
 		&"dialogue": _build_dialogue()
 		&"container": _build_container()
+		&"creature": _build_creature()
 	var frame: Variant = _panels.get(name)
 	if frame != null:
 		frame.visible = true
@@ -1014,5 +1016,181 @@ func _container_slot(index: int) -> Control:
 		_rebuild())
 	pc.mouse_entered.connect(func() -> void:
 		show_tooltip(_container.storage[index], _root.get_global_mouse_position()))
+	pc.mouse_exited.connect(hide_tooltip)
+	return pc
+
+
+# =============================================================================
+# creatures
+# =============================================================================
+
+func open_creature(m: Monster) -> void:
+	_creature = m
+	open(&"creature", true)
+
+
+## The animal's sheet: what it is, how well it went, what it has learnt, and
+## what it is carrying. Everything the taming system produces has to be legible
+## here or the player has no way of knowing whether it went well.
+func _build_creature() -> void:
+	_clear(&"creature")
+	if _creature == null or not is_instance_valid(_creature):
+		return
+	var m := _creature
+	var p := m.profile()
+	var col := _shell(&"creature", 640, 560)
+	col.add_child(title(m.nickname()))
+	col.add_child(body(m.species.display + " — " + m.status_line(), 13,
+		Color(0.72, 0.86, 0.72)))
+
+	if m.unconscious:
+		col.add_child(_meter("Torpor", m.torpor / maxf(m.torpor_max, 1.0),
+			Color(0.62, 0.52, 0.86), "%d / %d" % [int(m.torpor), int(m.torpor_max)]))
+		col.add_child(_meter("Fed", m.tame_progress(), Color(0.86, 0.72, 0.38),
+			"%d / %d" % [m.tame_feed, p.feed_required if p != null else 0]))
+		col.add_child(_meter("Effectiveness", m.tame_effectiveness,
+			Color(0.56, 0.86, 0.62), "%d%%" % int(m.tame_effectiveness * 100.0)))
+		var wants := p.best_food() if p != null else &""
+		var wt := Items.get_type(wants)
+		if wt != null:
+			col.add_child(body("It would most like %s. Narcotics keep it under."
+				% wt.display, 13, Color(0.80, 0.78, 0.74), true))
+	elif m.tamed:
+		col.add_child(_meter("Health", m.health / maxf(m.max_health, 1.0),
+			Color(0.86, 0.42, 0.40), "%d / %d" % [int(m.health), int(m.max_health)]))
+		col.add_child(_meter("Loyalty", 1.0 - m.tame_decay,
+			Color(0.94, 0.62, 0.72),
+			"bonded" if m.bonded else "%d%%" % int((1.0 - m.tame_decay) * 100.0)))
+		if m.maturity < 1.0:
+			col.add_child(_meter("Imprint", m.imprint, Color(0.86, 0.80, 0.52),
+				"%d%%" % int(m.imprint * 100.0)))
+	else:
+		col.add_child(_meter("Health", m.health / maxf(m.max_health, 1.0),
+			Color(0.86, 0.42, 0.40), "%d / %d" % [int(m.health), int(m.max_health)]))
+		col.add_child(_meter("Torpor", m.torpor / maxf(m.torpor_max, 1.0),
+			Color(0.62, 0.52, 0.86), "%d / %d" % [int(m.torpor), int(m.torpor_max)]))
+
+	# --- how this one is taken, and what still stands in the way
+	if p != null and not m.tamed:
+		col.add_child(body("Method: %s. Wildness %d%%, handling %d."
+			% [String(p.method), int(p.wildness * 100.0), p.min_handling], 13,
+			Color(0.78, 0.80, 0.86)))
+		var unmet := m.unmet_conditions()
+		if not unmet.is_empty():
+			var bits: Array[String] = []
+			for c: StringName in unmet:
+				bits.append(String(TameDB.COND_TEXT.get(c, String(c))))
+			col.add_child(body("Still needed: " + ", ".join(bits) + ".", 13,
+				Color(0.94, 0.70, 0.42), true))
+		if p.note != "":
+			col.add_child(body(p.note, 12, Color(0.70, 0.68, 0.66), true))
+
+	# --- training
+	if m.tamed and p != null:
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", PAD)
+		for skill: StringName in p.trainable:
+			var b := button(String(skill).capitalize(), 13)
+			if m.knows(skill):
+				b.disabled = true
+				b.text += " ✓"
+			elif not m.can_be_trained(skill):
+				b.disabled = true
+				b.tooltip_text = "Needs obedience first."
+			else:
+				b.pressed.connect(func() -> void:
+					if not m.train(skill) and game != null:
+						game.notify("%s does not take the lesson." % m.nickname(),
+							&"warn")
+					_rebuild())
+			row.add_child(b)
+		col.add_child(row)
+
+	# --- the creature's own bag
+	if m.carry_capacity > 0:
+		m._ensure_inventory()
+		col.add_child(body("Carrying", 13, Color(0.66, 0.62, 0.58)))
+		var grid := GridContainer.new()
+		grid.columns = 8
+		grid.add_theme_constant_override("h_separation", PAD)
+		grid.add_theme_constant_override("v_separation", PAD)
+		for i in m.inventory.size():
+			grid.add_child(_creature_slot(i))
+		col.add_child(grid)
+		col.add_child(body("Your bag", 13, Color(0.66, 0.62, 0.58)))
+		col.add_child(_slot_grid(Inventory.HOTBAR_START, Inventory.HOTBAR_SIZE, 9))
+	elif m.tamed:
+		col.add_child(body("It will not carry anything until it has been taught "
+			+ "to haul.", 13, Color(0.70, 0.68, 0.66), true))
+
+
+## A labelled bar. The taming system produces four numbers that all mean
+## different things, and four numbers in a row of text is unreadable.
+func _meter(label: String, frac: float, col: Color, right := "") -> Control:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", PAD)
+	var name_label := body(label, 13, Color(0.78, 0.76, 0.74))
+	name_label.custom_minimum_size = Vector2(112, 0)
+	row.add_child(name_label)
+	var bar := ProgressBar.new()
+	bar.min_value = 0.0
+	bar.max_value = 1.0
+	bar.value = clampf(frac, 0.0, 1.0)
+	bar.show_percentage = false
+	bar.custom_minimum_size = Vector2(320, 18)
+	var fill := StyleBoxFlat.new()
+	fill.bg_color = col
+	fill.set_corner_radius_all(3)
+	bar.add_theme_stylebox_override("fill", fill)
+	row.add_child(bar)
+	if right != "":
+		row.add_child(body(right, 13, col))
+	return row
+
+
+func _creature_slot(index: int) -> Control:
+	var stack: Items.Stack = _creature.inventory[index]
+	var pc := PanelContainer.new()
+	pc.custom_minimum_size = Vector2(SLOT, SLOT)
+	pc.add_theme_stylebox_override("panel", slot_style(false))
+	pc.mouse_filter = Control.MOUSE_FILTER_STOP
+	if not stack.is_empty():
+		var t := stack.type()
+		var icon := TextureRect.new()
+		icon.set_anchors_preset(Control.PRESET_FULL_RECT)
+		icon.offset_left = 5
+		icon.offset_top = 5
+		icon.offset_right = -5
+		icon.offset_bottom = -5
+		icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		icon.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		icon.texture = t.icon() if t != null else null
+		icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		pc.add_child(icon)
+		if stack.count > 1:
+			var n := Label.new()
+			n.text = str(stack.count)
+			n.add_theme_font_size_override("font_size", 12)
+			n.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
+			n.add_theme_constant_override("outline_size", 4)
+			n.position = Vector2(SLOT - 22, SLOT - 22)
+			n.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			pc.add_child(n)
+	pc.gui_input.connect(func(event: InputEvent) -> void:
+		var mb := event as InputEventMouseButton
+		if mb == null or not mb.pressed or mb.button_index != MOUSE_BUTTON_LEFT:
+			return
+		if _held.is_empty():
+			_held = _creature.inventory[index]
+			_creature.inventory[index] = Items.Stack.new()
+		else:
+			var tmp: Items.Stack = _creature.inventory[index]
+			_creature.inventory[index] = _held
+			_held = tmp
+		_refresh_held()
+		_rebuild())
+	pc.mouse_entered.connect(func() -> void:
+		show_tooltip(_creature.inventory[index], _root.get_global_mouse_position()))
 	pc.mouse_exited.connect(hide_tooltip)
 	return pc

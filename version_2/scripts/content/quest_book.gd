@@ -15,6 +15,7 @@ static func register_all() -> void:
 	_side_scientist()
 	_side_villager()
 	_side_drifter()
+	_side_handler()
 
 
 # ================================================================= campaign ====
@@ -200,3 +201,46 @@ static func _side_drifter() -> void:
 		.add(Quests.Kind.GATHER, &"advanced_circuit", 2, "Deliver advanced circuits") \
 		.add(Quests.Kind.GATHER, &"power_core", 1, "Deliver a power core") \
 		.rewards(900, [[&"dense_energy_cell", 2]])
+
+
+# ================================================================== taming ====
+## The taming ladder, given out by the xenologist. It walks the player up the
+## same rungs the system is built on: win one over by hand, put one under and
+## feed it, teach one to work, and then go after something that needs all three.
+static func _side_handler() -> void:
+	_side("side_first_friend", "First Friend", &"scientist",
+		"You will not survive out there alone, and I am not coming. Find "\
+		+ "something with a mouth and no strong opinions, and feed it until it "\
+		+ "follows you home.") \
+		.add(Quests.Kind.TAME, &"any", 1, "Tame any creature") \
+		.rewards(180, [[&"creature_feed", 12], [&"bola", 4]])
+
+	_side("side_sleeping_it_off", "Sleeping It Off", &"scientist",
+		"The interesting ones will not take food from a hand. They have to be "\
+		+ "put down first — properly down, not dead. There is a considerable "\
+		+ "difference and I would like you to learn it on something small.") \
+		.add(Quests.Kind.CRAFT, &"tranq_arrow", 8, "Make tranquiliser arrows") \
+		.add(Quests.Kind.TAME, &"voltip", 1, "Tame a voltip") \
+		.rewards(420, [[&"narcotic", 6], [&"handlers_collar", 1]])
+
+	_side("side_a_working_animal", "A Working Animal", &"scientist",
+		"A tame that will not carry anything is a pet. I have no use for pets "\
+		+ "and neither, out here, do you.") \
+		.add(Quests.Kind.TAME, &"yokat", 1, "Tame a yokat") \
+		.add(Quests.Kind.CRAFT, &"saddlebag", 1, "Make a saddlebag") \
+		.rewards(360, [[&"kibble", 8]])
+
+	_side("side_the_difficult_ones", "The Difficult Ones", &"scientist",
+		"Now the ones with conditions attached. The crustoise will not let "\
+		+ "anything through that shell, and the mandraflora has to be boxed in "\
+		+ "before it will hold still long enough to be reasoned with.") \
+		.add(Quests.Kind.TAME, &"crustoise", 1, "Tame a crustoise") \
+		.add(Quests.Kind.TAME, &"mandraflora", 1, "Tame a mandraflora") \
+		.rewards(880, [[&"strong_narcotic", 3], [&"capture_net", 4]])
+
+	_side("side_the_fennix", "The One That Burns", &"scientist",
+		"Three of them hunt together and they breathe fire, which does the "\
+		+ "tranquiliser no favours at all. Catch one alone, after dark, and "\
+		+ "already regretting its evening.") \
+		.add(Quests.Kind.TAME, &"fennix", 1, "Tame a fennix") \
+		.rewards(1600, [[&"tranq_rifle", 1], [&"tranq_dart", 24]])

@@ -107,6 +107,13 @@ func _ready() -> void:
 	max_health = species.health * threat_scale
 	health = max_health
 	shell = species.armour_hp * threat_scale
+	var tp := profile()
+	torpor_max = (tp.torpor_max if tp != null else 100.0) * threat_scale
+	# Every creature carries a bag from the moment it exists, wild or not. It is
+	# what you drop food into while it is unconscious, it is what a pack animal
+	# hauls in, and it is what spills on the ground when one dies.
+	carry_capacity = tp.carry_slots if tp != null else 8
+	_ensure_inventory()
 	_half = Vector3(species.size.x * 0.5, species.size.y * 0.5, species.size.z * 0.5)
 	hunger = _rng.randf() * 0.4
 	state = State.WANDER
@@ -178,6 +185,34 @@ func _physics_process(delta: float) -> void:
 	_charge_cd = maxf(_charge_cd - delta, 0.0)
 	_telegraph = maxf(_telegraph - delta, 0.0)
 	_hurt_flash = maxf(_hurt_flash - delta, 0.0)
+
+	_tick_torpor(delta)
+	_tick_tame_decay(delta)
+
+	# An unconscious creature is furniture: it still falls, it still renders,
+	# and it does nothing else until the torpor wears off.
+	if unconscious:
+		velocity.x = move_toward(velocity.x, 0.0, 12.0 * delta)
+		velocity.z = move_toward(velocity.z, 0.0, 12.0 * delta)
+		_apply_gravity(delta)
+		_sweep(delta)
+		_animate(delta)
+		return
+
+	# Tangled: it can still see you, still shout, and still bite anything that
+	# comes within reach — it simply cannot go anywhere.
+	if restrained > 0.0:
+		restrained -= delta
+		_tick_drives(delta)
+		_perceive(delta)
+		_choose_state()
+		velocity.x = 0.0
+		velocity.z = 0.0
+		_try_melee()
+		_apply_gravity(delta)
+		_sweep(delta)
+		_animate(delta)
+		return
 
 	_tick_drives(delta)
 	_perceive(delta)
@@ -286,7 +321,14 @@ func _set_state(next: int) -> void:
 
 func _choose_state() -> void:
 	if tamed:
-		_set_state(State.WANDER)
+		# An obedient tame keeps up with its handler; an untrained one wanders
+		# wherever it likes and you fetch it yourself.
+		if knows(&"obedience") and player != null and player.is_alive() \
+				and global_position.distance_to(player.global_position) > 5.0:
+			_set_state(State.RETURN)
+			home = player.global_position
+		else:
+			_set_state(State.WANDER)
 		return
 
 	# --- broken: nothing else matters
@@ -740,24 +782,612 @@ func _try_shoot() -> void:
 # =============================================================================
 # taming
 # =============================================================================
+#
+# Two routes to the same creature, and which one is open depends on the animal.
+#
+#   PASSIVE — RimWorld's. Walk up holding food it wants and try. The roll is
+#     `(4% + 3% × handling) × 2 × (1 − wildness)`, gated by a minimum handling
+#     skill and by whatever conditions the species insists on. A failure locks
+#     you out for a while and may turn the animal on you.
+#
+#   KNOCKOUT — Ark's. Put it under with something that deals torpor, then feed
+#     it while it sleeps. Torpor drains the whole time. Every point of real
+#     damage it takes on the way down costs you taming effectiveness, which is
+#     what the finished creature's quality is made of.
+#
+# TRAP and REPAIR are knockout with an extra precondition attached.
 
-## Offer food. Works best on a calm creature — a frightened or hostile one will
-## not take anything from you.
-func offer(item: StringName) -> bool:
-	if tamed or not species.likes(item):
+## Slots in this creature's own bag. Empty until it is tamed, at which point it
+## can be handed things and told to carry them.
+var inventory: Array[Items.Stack] = []
+var carry_capacity := 0
+
+## Ark side.
+var torpor := 0.0
+var torpor_max := 100.0
+var unconscious := false
+var tame_feed := 0                 ## bites taken while under
+var tame_effectiveness := 1.0      ## 0..1; damage taken while under erodes it
+var _feed_cd := 0.0
+
+## RimWorld side.
+var tame_cooldown := 0.0           ## seconds until another attempt is allowed
+var restrained := 0.0              ## seconds a bola or net is still holding it
+var bonded := false
+var tame_decay := 0.0              ## 0..1; at 1 an unmaintained tame goes feral
+var handler_name := ""
+
+## Culture.
+var training := {}                 ## StringName -> true
+var maturity := 1.0                ## 0 juvenile .. 1 adult
+var imprint := 0.0                 ## 0..1, raised by tending a juvenile
+var given_name := ""
+
+var _tame_profile: TameDB.Profile = null
+var _boxed_cell := Vector3i(0, -999, 0)
+var _boxed_at := -99.0
+var _boxed_cache := false
+var _dark_at := -99.0
+var _dark_cache := false
+
+
+func profile() -> TameDB.Profile:
+	if _tame_profile == null:
+		_tame_profile = TameDB.get_profile(species.id)
+	return _tame_profile
+
+
+func wildness() -> float:
+	var p := profile()
+	return p.wildness if p != null else 0.5
+
+
+## What this creature answers to. A named tame stops being "a Poptop".
+func nickname() -> String:
+	return given_name if given_name != "" else species.display
+
+
+func knows(skill: StringName) -> bool:
+	return bool(training.get(skill, false))
+
+
+func can_be_trained(skill: StringName) -> bool:
+	var p := profile()
+	if p == null or not tamed or knows(skill):
 		return false
-	if alert > 0.6 or fear > 0.4:
+	if not p.trainable.has(skill):
 		return false
-	hunger = maxf(hunger - 0.5, 0.0)
-	bond += 0.34
-	_mood_flash("<3", Color(0.98, 0.62, 0.72))
-	if bond >= 1.0:
-		tamed = true
-		fear = 0.0
-		alert = 0.0
-		if game != null:
-			game.notify("The %s decides you are alright." % species.display, &"quest")
+	# Everything is built on obedience, exactly as in RimWorld: an animal that
+	# will not come when called cannot be told to haul or to attack.
+	return skill == &"obedience" or knows(&"obedience")
+
+
+func train(skill: StringName) -> bool:
+	if not can_be_trained(skill):
+		return false
+	# Imprinted and bonded creatures learn; a barely-tamed one may not.
+	var odds := clampf(0.35 + imprint * 0.4 + (0.25 if bonded else 0.0)
+		+ tame_effectiveness * 0.3 - wildness() * 0.3, 0.05, 0.98)
+	if _rng.randf() > odds:
+		return false
+	training[skill] = true
+	if game != null:
+		game.notify("%s learns to %s." % [nickname(), String(skill)], &"quest")
 	return true
+
+
+# ----------------------------------------------------------------- conditions
+
+## Every species condition that is *not* currently satisfied. An empty array
+## means you may proceed.
+func unmet_conditions() -> Array[StringName]:
+	var out: Array[StringName] = []
+	var p := profile()
+	if p == null:
+		return out
+	for c: StringName in p.conditions:
+		if not _condition_met(c):
+			out.append(c)
+	return out
+
+
+func _condition_met(c: StringName) -> bool:
+	match c:
+		TameDB.COND_CROUCH:
+			return player != null and player.is_sneaking()
+		TameDB.COND_NIGHT:
+			return game != null and game.sky.is_night()
+		TameDB.COND_DAY:
+			return game != null and not game.sky.is_night()
+		TameDB.COND_DARK:
+			return _in_darkness()
+		TameDB.COND_SHELL_BROKEN:
+			return shell <= 0.0
+		TameDB.COND_WOUNDED:
+			return health <= max_health * 0.25
+		TameDB.COND_TRAPPED:
+			# A net is walls you brought with you, so it counts.
+			return restrained > 0.0 or is_boxed_in()
+		TameDB.COND_ASLEEP:
+			return state == State.SLEEP or unconscious
+		TameDB.COND_ALONE:
+			return _kin_within(14.0) == 0
+		TameDB.COND_RAIN:
+			return game != null and (game.sky.weather == &"rain"
+				or game.sky.weather == &"storm")
+	return true
+
+
+## Roofed over, and no lamp burning nearby. Cached alongside the trapped test
+## for the same reason: the HUD asks constantly and lamps do not move.
+func _in_darkness() -> bool:
+	if world == null:
+		return false
+	var now := float(Time.get_ticks_msec()) * 0.001
+	if now - _dark_at < 0.25:
+		return _dark_cache
+	_dark_at = now
+	_dark_cache = _measure_darkness()
+	return _dark_cache
+
+
+func _measure_darkness() -> bool:
+	var c := Vector3i(floori(global_position.x), floori(global_position.y + _half.y),
+		floori(global_position.z))
+	if not world.is_covered(c.x, c.y, c.z):
+		return false
+	if game == null or game.objects_root == null:
+		return true
+	for n in game.objects_root.get_children():
+		var o := n as PlacedObject
+		if o == null or o.def.kind != ObjectDB.Kind.LIGHT:
+			continue
+		if Vector3(o.cell).distance_to(global_position) < 9.0:
+			return false
+	return true
+
+
+func _kin_within(radius: float) -> int:
+	var n := 0
+	var parent := get_parent()
+	if parent == null:
+		return 0
+	for child in parent.get_children():
+		var m := child as Monster
+		if m == null or m == self or m._dying or m.tamed:
+			continue
+		if m.species.id != species.id:
+			continue
+		if m.global_position.distance_to(global_position) <= radius:
+			n += 1
+	return n
+
+
+## Can it walk away? A flood through the air around it, stopped early. If it
+## cannot reach open sky or a reasonable volume, it has been boxed in — by a
+## purpose-built pen, by a cave-in, or by a net.
+##
+## The HUD asks this every frame while you stand next to a creature, so the
+## answer is cached for a quarter second and against the cell it was computed
+## in. Walls do not move faster than that.
+func is_boxed_in(budget := 90) -> bool:
+	if world == null:
+		return false
+	var here := Vector3i(floori(global_position.x),
+		floori(global_position.y + 0.1), floori(global_position.z))
+	var now := float(Time.get_ticks_msec()) * 0.001
+	if here == _boxed_cell and now - _boxed_at < 0.25:
+		return _boxed_cache
+	_boxed_cell = here
+	_boxed_at = now
+	_boxed_cache = _flood_boxed_in(here, budget)
+	return _boxed_cache
+
+
+func _flood_boxed_in(start_cell: Vector3i, budget: int) -> bool:
+	if bool(species.flags.get(&"phases_terrain", false)):
+		return false     # it walks through the wall; nothing will hold it
+	var seen := {start_cell: true}
+	var queue: Array[Vector3i] = [start_cell]
+	var visited := 0
+	while not queue.is_empty():
+		var c: Vector3i = queue.pop_back()
+		visited += 1
+		if visited > budget:
+			return false
+		if not world.is_covered(c.x, c.y, c.z):
+			return false     # it can see the sky from here
+		for d: Vector3i in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0),
+				Vector3i(0, 0, 1), Vector3i(0, 0, -1),
+				Vector3i(0, 1, 0), Vector3i(0, -1, 0)]:
+			var n: Vector3i = c + d
+			if seen.has(n) or world.is_solid_at(n.x, n.y, n.z):
+				continue
+			seen[n] = true
+			queue.append(n)
+	return true
+
+
+# --------------------------------------------------------------- passive tame
+
+## What a passive attempt would cost and what it would pay. Returned as a
+## dictionary so the UI can explain the situation before anything is spent.
+func tame_report(item: StringName, handling: int) -> Dictionary:
+	var p := profile()
+	if p == null:
+		return {"ok": false, "reason": "This one cannot be tamed."}
+	if tamed:
+		return {"ok": false, "reason": "%s is already yours." % nickname()}
+	var quality := p.food_quality(item)
+	if quality <= 0.0:
+		return {"ok": false, "reason": "It has no interest in that.",
+			"wants": p.best_food()}
+	if p.method != TameDB.METHOD_PASSIVE and not unconscious:
+		return {"ok": false, "method": p.method,
+			"reason": "It will not take food while it is awake."}
+	if tame_cooldown > 0.0:
+		return {"ok": false, "reason": "It is still wary of you. (%ds)"
+			% int(ceil(tame_cooldown))}
+	if handling < p.min_handling:
+		return {"ok": false, "reason": "You do not know enough about animals "
+			+ "to handle this one. (handling %d needed)" % p.min_handling}
+	var unmet := unmet_conditions()
+	if not unmet.is_empty():
+		var bits: Array[String] = []
+		for c: StringName in unmet:
+			bits.append(String(TameDB.COND_TEXT.get(c, String(c))))
+		return {"ok": false, "reason": "It must be " + ", ".join(bits) + ".",
+			"unmet": unmet}
+	if alert > 0.75 or fear > 0.5:
+		return {"ok": false, "reason": "It is too worked up to take anything."}
+	return {"ok": true, "chance": p.tame_chance(handling) * clampf(quality, 0.4, 1.6),
+		"quality": quality}
+
+
+## One passive attempt. Consumes nothing itself — the caller removes the food —
+## and returns what happened so the caller can narrate it.
+func try_tame(item: StringName, handling: int) -> Dictionary:
+	var report := tame_report(item, handling)
+	if not report.get("ok", false):
+		return report
+	var p := profile()
+	hunger = maxf(hunger - 0.5, 0.0)
+	var chance := float(report["chance"])
+	if _rng.randf() < chance:
+		bond = 1.0
+		finish_tame(clampf(0.55 + float(report["quality"]) * 0.25, 0.3, 1.0),
+			handling)
+		return {"ok": true, "tamed": true, "chance": chance}
+
+	# Failure. RimWorld's cost: a long cooldown, and a real chance the animal
+	# decides it has had enough of you.
+	tame_cooldown = 90.0
+	bond = maxf(bond - 0.15, 0.0)
+	_mood_flash("?", Color(0.96, 0.88, 0.42))
+	var revenge := _rng.randf() < p.revenge
+	if revenge:
+		fear = 0.0
+		alert = 1.0
+		has_last_known = player != null
+		if player != null:
+			last_known = player.global_position
+		_set_state(State.CHASE)
+		alarm(global_position, 16.0, false)
+	return {"ok": true, "tamed": false, "revenge": revenge, "chance": chance}
+
+
+# -------------------------------------------------------------- knockout tame
+
+## Torpor, not damage. Positive puts it under, negative wakes it up.
+func apply_torpor(amount: float) -> void:
+	if _dying or tamed:
+		return
+	var p := profile()
+	if p != null and torpor_max <= 0.0:
+		torpor_max = p.torpor_max
+	# A shell keeps a dart out as surely as it keeps a blade out.
+	if shell > 0.0 and amount > 0.0:
+		amount *= 0.15
+	torpor = clampf(torpor + amount, 0.0, torpor_max * 2.0)
+	if amount > 0.0 and not unconscious:
+		alert = 1.0
+		if torpor >= torpor_max:
+			_go_under()
+	elif amount < 0.0 and unconscious and torpor <= 0.0:
+		wake_up()
+
+
+func _go_under() -> void:
+	unconscious = true
+	velocity = Vector3(0, velocity.y, 0)
+	tame_feed = 0
+	tame_effectiveness = 1.0
+	_feed_cd = 0.0
+	_set_state(State.SLEEP)
+	_mood_flash("z", Color(0.62, 0.68, 0.86))
+	if game != null:
+		game.notify("%s goes down." % species.display, &"quest")
+
+
+func wake_up() -> void:
+	if not unconscious:
+		return
+	unconscious = false
+	torpor = 0.0
+	if not tamed:
+		# Ark's punishment for running out of narcotics: the meal is wasted.
+		tame_feed = 0
+		fear = minf(fear + 0.4, 1.0)
+		alert = 1.0
+		if game != null and tame_effectiveness < 1.0:
+			game.notify("%s comes round, and remembers you." % species.display,
+				&"warn")
+
+
+## Torpor bleeds off the whole time it is under, and it eats on a timer rather
+## than as fast as you can click.
+func _tick_torpor(delta: float) -> void:
+	var p := profile()
+	if p == null:
+		return
+	_feed_cd = maxf(_feed_cd - delta, 0.0)
+	tame_cooldown = maxf(tame_cooldown - delta, 0.0)
+	if not unconscious:
+		if torpor > 0.0:
+			torpor = maxf(torpor - p.torpor_drain * 1.6 * delta, 0.0)
+		return
+	torpor -= p.torpor_drain * delta
+	if torpor <= 0.0:
+		wake_up()
+		return
+	# Ark's actual loop: you fill the sleeping creature's bag and walk away, and
+	# it works through it on its own timer while you keep the torpor topped up.
+	if _feed_cd <= 0.0:
+		_eat_from_bag()
+
+
+## Take the best thing in its own bag and eat it. Narcotics are drawn on only
+## when the torpor is genuinely running out, so a stack left in the bag lasts
+## the whole tame instead of being swallowed in the first ten seconds.
+func _eat_from_bag() -> void:
+	var p := profile()
+	if p == null:
+		return
+	var best := -1
+	var best_q := 0.0
+	var narcotic := -1
+	for i in inventory.size():
+		var s: Items.Stack = inventory[i]
+		if s.is_empty():
+			continue
+		var t := Items.get_type(s.id)
+		if t != null and t.has_tag(&"narcotic"):
+			if narcotic < 0:
+				narcotic = i
+			continue
+		var q := p.food_quality(s.id)
+		if q > best_q:
+			best_q = q
+			best = i
+	if narcotic >= 0 and torpor < torpor_max * 0.35:
+		var ns: Items.Stack = inventory[narcotic]
+		var nt := Items.get_type(ns.id)
+		torpor = minf(torpor + (nt.torpor if nt != null else 40.0), torpor_max * 2.0)
+		_take_one(narcotic)
+		return
+	if best < 0:
+		return
+	feed_unconscious(inventory[best].id)
+	_take_one(best)
+
+
+func _take_one(index: int) -> void:
+	var s: Items.Stack = inventory[index]
+	s.count -= 1
+	if s.count <= 0:
+		s.clear()
+
+
+## Put one item into the sleeping creature. Narcotics top the torpor back up;
+## food advances the tame. Returns what happened.
+func feed_unconscious(item: StringName) -> Dictionary:
+	if not unconscious:
+		return {"ok": false, "reason": "It is not asleep."}
+	var t := Items.get_type(item)
+	if t != null and t.has_tag(&"narcotic"):
+		torpor = minf(torpor + t.torpor, torpor_max * 2.0)
+		return {"ok": true, "narcotic": true, "torpor": torpor}
+	var p := profile()
+	if p == null:
+		return {"ok": false, "reason": "This one cannot be tamed."}
+	var quality := p.food_quality(item)
+	if quality <= 0.0:
+		return {"ok": false, "reason": "It will not eat that.",
+			"wants": p.best_food()}
+	if _feed_cd > 0.0:
+		return {"ok": false, "reason": "It is still swallowing the last one.",
+			"wait": _feed_cd}
+	var unmet := unmet_conditions()
+	if not unmet.is_empty():
+		var bits: Array[String] = []
+		for c: StringName in unmet:
+			bits.append(String(TameDB.COND_TEXT.get(c, String(c))))
+		return {"ok": false, "reason": "It must be " + ", ".join(bits) + "."}
+
+	_feed_cd = p.feed_interval / maxf(quality, 0.3)
+	# Better food does more per bite, so kibble genuinely halves the work.
+	tame_feed += maxi(1, int(round(quality)))
+	hunger = maxf(hunger - 0.3, 0.0)
+	var done: bool = tame_feed >= p.feed_required
+	if done:
+		finish_tame(tame_effectiveness, 0)
+	return {"ok": true, "narcotic": false, "done": done,
+		"progress": float(tame_feed) / float(maxi(1, p.feed_required))}
+
+
+func tame_progress() -> float:
+	var p := profile()
+	if p == null or p.feed_required <= 0:
+		return 0.0
+	return clampf(float(tame_feed) / float(p.feed_required), 0.0, 1.0)
+
+
+# ------------------------------------------------------------------- the tame
+
+func finish_tame(effectiveness: float, handling := 0) -> void:
+	if tamed:
+		return
+	var p := profile()
+	tamed = true
+	unconscious = false
+	torpor = 0.0
+	fear = 0.0
+	alert = 0.0
+	bond = 1.0
+	tame_decay = 0.0
+	tame_effectiveness = clampf(effectiveness, 0.1, 1.0)
+	# Effectiveness is not cosmetic: it is what the creature is made of.
+	max_health *= 1.0 + tame_effectiveness * 0.5
+	health = max_health
+	# A well-taken creature carries more, but never fewer slots than it already
+	# had — shrinking the bag would quietly eat whatever was in it.
+	carry_capacity = maxi(carry_capacity, int(round(
+		(p.carry_slots if p != null else 8) * (0.7 + tame_effectiveness * 0.6))))
+	_ensure_inventory()
+	if p != null and _rng.randf() < p.bond_chance * (0.5 + tame_effectiveness):
+		bonded = true
+	if player != null:
+		handler_name = "you"
+		player.gain_handling(1.0 + wildness() * 3.0)
+	_set_state(State.WANDER)
+	_mood_flash("<3", Color(0.98, 0.62, 0.72))
+	if game != null:
+		var line := "The %s decides you are alright." % species.display
+		if bonded:
+			line = "The %s bonds with you." % species.display
+		game.notify(line, &"quest")
+		game.on_monster_tamed(self)
+
+
+## Wildness pulls a tame back toward wild unless it is fed now and then, which
+## is RimWorld's maintenance taming. Bonded animals never drift.
+func _tick_tame_decay(delta: float) -> void:
+	if not tamed or bonded:
+		return
+	var w := wildness()
+	if w <= 0.0:
+		return
+	tame_decay += delta * w * 0.0016
+	if tame_decay >= 1.0:
+		go_feral()
+
+
+func go_feral() -> void:
+	if not tamed:
+		return
+	tamed = false
+	bond = 0.0
+	tame_decay = 0.0
+	training.clear()
+	fear = 0.0
+	alert = 0.6
+	drop_inventory()
+	if game != null:
+		game.notify("%s has gone wild again." % nickname(), &"warn")
+
+
+## Feeding a tame keeps it tame. Anything it eats will do.
+func tend(item: StringName) -> bool:
+	if not tamed:
+		return false
+	var p := profile()
+	if p == null or p.food_quality(item) <= 0.0:
+		return false
+	tame_decay = maxf(tame_decay - 0.5, 0.0)
+	hunger = maxf(hunger - 0.6, 0.0)
+	if maturity < 1.0:
+		# Ark's imprinting: a juvenile that is tended grows up better.
+		imprint = minf(imprint + 0.15, 1.0)
+	_mood_flash("<3", Color(0.98, 0.62, 0.72))
+	return true
+
+
+# ------------------------------------------------------------------ inventory
+
+func _ensure_inventory() -> void:
+	if inventory.size() == carry_capacity:
+		return
+	var old := inventory
+	inventory = []
+	inventory.resize(carry_capacity)
+	for i in carry_capacity:
+		inventory[i] = old[i] if i < old.size() else Items.Stack.new()
+
+
+func can_carry() -> bool:
+	return tamed and carry_capacity > 0 and knows(&"haul")
+
+
+## Put a stack into the creature's bag. Returns the remainder.
+func store(stack: Items.Stack) -> int:
+	if carry_capacity <= 0:
+		return stack.count
+	_ensure_inventory()
+	for s: Items.Stack in inventory:
+		if stack.is_empty():
+			break
+		if not s.is_empty() and s.id == stack.id and s.data == stack.data:
+			s.merge_from(stack)
+	for s: Items.Stack in inventory:
+		if stack.is_empty():
+			break
+		if s.is_empty():
+			s.merge_from(stack)
+	return stack.count
+
+
+func carried_count() -> int:
+	var n := 0
+	for s: Items.Stack in inventory:
+		if not s.is_empty():
+			n += s.count
+	return n
+
+
+## Everything the creature is holding, scattered where it stands. Called when a
+## tame dies or reverts.
+func drop_inventory() -> void:
+	if game == null:
+		return
+	for s: Items.Stack in inventory:
+		if s.is_empty():
+			continue
+		game.drop_item(s.id, s.count, global_position + Vector3(0, 0.4, 0))
+		s.clear()
+
+
+## One line summarising where this creature stands, for the HUD and the journal.
+func status_line() -> String:
+	if tamed:
+		var bits: Array[String] = ["tame %d%%" % int(tame_effectiveness * 100.0)]
+		if bonded:
+			bits.append("bonded")
+		if not training.is_empty():
+			var skills: Array[String] = []
+			for k: StringName in training:
+				skills.append(String(k))
+			skills.sort()
+			bits.append("/".join(skills))
+		if carry_capacity > 0:
+			bits.append("%d/%d carried" % [carried_count(), carry_capacity])
+		return ", ".join(bits)
+	if unconscious:
+		return "unconscious — %d%% fed, %d%% effective, torpor %d" % [
+			int(tame_progress() * 100.0), int(tame_effectiveness * 100.0),
+			int(torpor)]
+	if torpor > 0.0:
+		return "torpor %d/%d" % [int(torpor), int(torpor_max)]
+	return String(state_name())
 
 
 # =============================================================================
@@ -799,7 +1429,9 @@ func _animate(delta: float) -> void:
 	_revealed = lerpf(_revealed, want_alpha, 1.0 - exp(-8.0 * delta))
 
 	var tint := Color(1, 1, 1, _revealed)
-	if _hurt_flash > 0.0:
+	if unconscious:
+		tint = Color(0.58, 0.64, 0.82, _revealed)
+	elif _hurt_flash > 0.0:
 		tint = Color(3.0, 0.9, 0.9, _revealed)
 	elif _telegraph > 0.0:
 		tint = Color(1.9, 1.2, 0.9, _revealed)   # winding up
@@ -811,7 +1443,9 @@ func _animate(delta: float) -> void:
 
 	# squash while asleep so a sleeping creature reads at a glance
 	var squash := Vector3.ONE
-	if state == State.SLEEP:
+	if unconscious:
+		squash = Vector3(1.35, 0.42, 1.0)     # flat out on the ground
+	elif state == State.SLEEP:
 		squash = Vector3(1.1, 0.7, 1.0)
 	sprite.scale = sprite.scale.lerp(squash, 1.0 - exp(-8.0 * delta))
 
@@ -858,6 +1492,16 @@ func hurt(amount: float, element: StringName = Blocks.ELEM_PHYSICAL,
 	_hurt_flash = 0.16
 	velocity += knock
 
+	# Ark's central trade-off, and the reason a tranquiliser is worth carrying:
+	# a sleeping creature that keeps being hit is worth less when it wakes up.
+	if unconscious:
+		if health <= 0.0:
+			_die(source)
+		else:
+			tame_effectiveness = maxf(tame_effectiveness
+				- dealt / maxf(max_health, 1.0) * 0.8, 0.05)
+		return dealt
+
 	# being hit wakes anything, un-disguises an ambusher and frightens the timid
 	alert = 1.0
 	if player != null:
@@ -887,6 +1531,7 @@ func _die(source: Node) -> void:
 	if _dying:
 		return
 	_dying = true
+	drop_inventory()
 	if game != null:
 		game.on_monster_died(self, source)
 		if bool(species.flags.get(&"death_burst", false)):
