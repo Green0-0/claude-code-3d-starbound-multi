@@ -1060,7 +1060,11 @@ func try_tame(item: StringName, handling: int) -> Dictionary:
 		return {"ok": true, "tamed": true, "chance": chance}
 
 	# Failure. RimWorld's cost: a long cooldown, and a real chance the animal
-	# decides it has had enough of you.
+	# decides it has had enough of you. You still learn something from it —
+	# handling experience comes from the attempt, not from the result, which is
+	# what stops a handler being permanently locked out by one wild species.
+	if player != null:
+		player.gain_handling(0.5 + wildness())
 	tame_cooldown = 90.0
 	bond = maxf(bond - 0.15, 0.0)
 	_mood_flash("?", Color(0.96, 0.88, 0.42))
