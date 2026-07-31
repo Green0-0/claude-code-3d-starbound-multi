@@ -772,8 +772,10 @@ func _cutaway_modes() -> void:
 	world._rebuild_fill()
 	check("open sky is not an enclosed space", cut.fill_empty)
 	var sight_mid := (cut.camera_position + cut.target_position) * 0.5
-	check("with no pocket, fill falls back to the drill",
-		cut.is_cut(int(floor(sight_mid.x)), int(floor(sight_mid.y)),
+	# The old build quietly turned into the cylinder here. It must not: fill
+	# answers "what room am I in", and out of doors the answer is "none".
+	check("with no pocket, fill cuts nothing at all",
+		not cut.is_cut(int(floor(sight_mid.x)), int(floor(sight_mid.y)),
 			int(floor(sight_mid.z))))
 
 	# carve a sealed room a little away and stand the player in it
@@ -792,19 +794,38 @@ func _cutaway_modes() -> void:
 	world.update_cutaway(room_target + Vector3(0, 15, -22), room_target)
 	world._rebuild_fill()
 	check("fill finds the room", not cut.fill_empty and cut.fill_size.x > 0)
-	check("fill covers the whole room, not a cone",
-		cut.in_fill(room.x + 3, room.y + 2, room.z + 2), "far corner of the room")
-	check("fill never marks the open sky",
-		not cut.in_fill(feet.x, VoxelWorld.WH - 2, feet.z))
-	# The shadow is a diagonal corridor toward the lens, not a vertical column,
-	# so scan for it rather than guessing one cell.
-	var occluders := 0
-	for dz in range(-10, 1):
-		for dy in range(5, 14):
-			if cut.is_cut(room.x, room.y + dy, room.z + dz):
-				occluders += 1
+	# The mask is one depth per column of the view plane, so the room's whole
+	# footprint must be represented — a cone would leave the far corners at zero.
+	var covered := 0
+	for dx in range(-2, 5):
+		for dz in range(-3, 4):
+			var u := (room.z + dz if cut.fill_axis == 0 else room.x + dx) \
+				- cut.fill_origin.x
+			var v := room.y + 2 - cut.fill_origin.y
+			if u < 0 or v < 0 or u >= cut.fill_size.x or v >= cut.fill_size.y:
+				continue
+			if cut.fill_depth[v * cut.fill_size.x + u] > 0:
+				covered += 1
+	check("fill covers the whole room, not a cone", covered >= 20,
+		"%d columns of the room's footprint" % covered)
+
+	# Everything between the room and the lens goes, and nothing behind it does.
+	var toward_lens := cut.plane_toward()
+	var along_axis := cut.fill_axis
+	var in_front := Vector3i(room.x, room.y + 2, room.z)
+	var behind := Vector3i(room.x, room.y + 2, room.z)
+	if along_axis == 0:
+		in_front.x += toward_lens * 6
+		behind.x -= toward_lens * 6
+	else:
+		in_front.z += toward_lens * 6
+		behind.z -= toward_lens * 6
 	check("fill removes what stands between the room and the lens",
-		occluders > 0, "%d cells above the room" % occluders)
+		cut.is_cut(in_front.x, in_front.y, in_front.z), str(in_front))
+	check("fill leaves everything behind the room alone",
+		not cut.is_cut(behind.x, behind.y, behind.z), str(behind))
+	check("fill never touches the open sky",
+		not cut.is_cut(feet.x, VoxelWorld.WH - 2, feet.z))
 
 	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
 	world.update_cutaway(cam, target)
@@ -817,8 +838,43 @@ func _cutaway_modes() -> void:
 	check("planar cuts nothing while you are in the open",
 		not cut.is_cut(front.x, front.y, front.z))
 	cut.occluded = true
-	check("planar cuts the slab in front once you are covered",
+	check("planar cuts past the plane once you are covered",
 		cut.is_cut(front.x, front.y, front.z), str(front))
+
+	# Planar is a half-space, not a box. It has no lateral, vertical or far
+	# bound: if it is past the plane, it is gone, however far away.
+	var far_out := Vector3i(feet.x + 40, feet.y + 20, feet.z - 60)
+	check("planar has no far bound", cut.is_cut(far_out.x, far_out.y, far_out.z),
+		str(far_out))
+	check("planar has no lateral bound",
+		cut.is_cut(feet.x - 40, feet.y, feet.z - 6))
+	check("planar leaves everything on your side of the plane alone",
+		not cut.is_cut(feet.x + 40, feet.y + 20, feet.z + 3))
+
+	# And the whole point: the cut depends on one coordinate, so walking across
+	# the plane or up and down it must not invalidate the cut set. Only the cap
+	# *window* follows the player sideways, and only every sixteen blocks.
+	var plane_here := cut.plane_coord()
+	var sig_here := cut.signature(0)
+	var moved_sig := 0
+	var prev_sig := sig_here
+	for step in 8:
+		cut.place(cam + Vector3(step + 1, 0, 0), target + Vector3(step + 1, 0, 0))
+		var now := cut.signature(0)
+		if now != prev_sig:
+			moved_sig += 1
+		prev_sig = now
+	check("walking across the plane never moves the plane",
+		cut.plane_coord() == plane_here,
+		"%d vs %d" % [cut.plane_coord(), plane_here])
+	check("walking across the plane rebuilds at most once per chunk",
+		moved_sig <= 1, "%d of 8 sideways steps invalidated" % moved_sig)
+
+	cut.place(cam, target)
+	cut.place(cam + Vector3(0, 0, -2), target + Vector3(0, 0, -2))
+	check("stepping along the view axis does move the plane",
+		cut.plane_coord() != plane_here)
+	world.update_cutaway(cam, target)
 	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
 
 	# --- presentation toggles
@@ -855,6 +911,54 @@ func _cutaway_modes() -> void:
 	await _settle(3)
 	check("breaking a block rebuilds the cross-section immediately",
 		world.cut_rebuilds > before_break)
+
+	# --- and the block itself stops being drawn on the very next frame.
+	#
+	# This is the ghost. The chunk remesh used to sit in the same time-budgeted
+	# queue as terrain streaming, so under load — which in a cut mode is most of
+	# the time — a destroyed block could keep its faces for many frames. Player
+	# edits now jump that queue, and this holds them to it in every mode.
+	for mode: int in [Cutaway.Mode.CYLINDER, Cutaway.Mode.FILL, Cutaway.Mode.PLANAR]:
+		world.set_cutaway_mode(mode)
+		var cell := Vector3i(feet2.x + 2, feet2.y + 1, feet2.z)
+		world.set_block(cell.x, cell.y, cell.z, Blocks.STONE)
+		await _settle(4)
+		var standing := _own_faces_at(cell)
+		world.set_block(cell.x, cell.y, cell.z, Blocks.AIR)
+		await _settle(1)
+		check("%s: a destroyed block is gone the next frame" % cut.mode_name(),
+			standing > 0 and _own_faces_at(cell) == 0,
+			"%d faces before, %d after one frame" % [standing, _own_faces_at(cell)])
+	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+
+
+## How many of a cell's *own* outward faces the chunk mesh is still drawing.
+##
+## Counting vertices in the cell's box cannot answer this: breaking a block also
+## gives its neighbours new faces on those same planes, so a correct break reads
+## as a rise. The normals separate them — a block's own faces point out of it.
+func _own_faces_at(cell: Vector3i) -> int:
+	var c = world._chunks.get(Vector2i(cell.x >> 4, cell.z >> 4))
+	if c == null or c.mi == null or c.mi.mesh == null:
+		return 0
+	var centre := Vector3(cell) + Vector3(0.5, 0.5, 0.5)
+	var offset: Vector3 = c.mi.global_position
+	var own := 0
+	for s in c.mi.mesh.get_surface_count():
+		var arrays: Array = c.mi.mesh.surface_get_arrays(s)
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var norms: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL]
+		if norms.size() != verts.size():
+			continue
+		var i := 0
+		while i + 3 < verts.size():
+			var mid := (verts[i] + verts[i + 1] + verts[i + 2] + verts[i + 3]) \
+				* 0.25 + offset - centre
+			if absf(mid.x) <= 0.51 and absf(mid.y) <= 0.51 and absf(mid.z) <= 0.51 \
+					and mid.dot(norms[i]) > 0.0:
+				own += 1
+			i += 4
+	return own
 
 
 func _space() -> void:

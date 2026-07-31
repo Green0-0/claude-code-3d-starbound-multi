@@ -15,23 +15,24 @@ global uniform float cut_keep_radius;
 global uniform float cut_keep_bias;
 global uniform float cut_opacity;
 global uniform float cut_fade;
-global uniform float cut_planar_depth;
-global uniform float cut_planar_width;
-global uniform float cut_planar_below;
-global uniform float cut_planar_above;
+global uniform float cut_planar_depth;   // how far in front of you the plane sits
 global uniform float cut_occluded;
 global uniform vec3 cut_anchor;      // the player's block, in whole voxels
 global uniform vec3 cut_toward;      // unit step from the player toward the lens
 global uniform vec3 cut_lateral;     // unit step across the screen
 global uniform float cut_fill_empty; // 1 when the flood found no enclosed space
 
-// The flood-filled volume, packed as a grid of z-slices. Set per material by
-// VoxelWorld rather than as a global, because global sampler uniforms cannot be
-// swapped as cheaply as this one needs to be.
+// The pocket depth mask: one texel per column of the plane across the view axis,
+// holding how far toward the lens that column's air pocket reaches. Set per
+// material by VoxelWorld rather than as a global, because global sampler
+// uniforms cannot be swapped as cheaply as this one needs to be.
 uniform sampler2D cut_fill_tex : filter_nearest, repeat_disable;
-uniform vec3 cut_fill_origin = vec3(0.0);
-uniform vec3 cut_fill_size = vec3(0.0);
-uniform float cut_fill_cols = 1.0;
+uniform vec3 cut_fill_origin = vec3(0.0);   // across, up, unused
+uniform vec2 cut_fill_size = vec2(0.0);     // across, up
+uniform float cut_fill_axis = 2.0;          // 0 = view runs along x, 2 = along z
+uniform float cut_fill_toward = 1.0;        // which way the lens is, +1 or -1
+uniform float cut_fill_base = 0.0;          // where depths are measured from
+uniform float cut_fill_slope = 0.0;         // sight-line rise per block of depth
 
 const float CUT_BAYER[16] = float[](
 	0.0625, 0.5625, 0.1875, 0.6875,
@@ -85,35 +86,36 @@ bool cut_in_cylinder(vec3 bc) {
 }
 
 
-bool cut_in_fill(vec3 bc) {
+// Is this block standing between the lens and the room the player is in? One
+// texel fetch and one compare, whatever the shape of the room.
+bool cut_in_front_of_pocket(vec3 bc) {
 	if (cut_fill_size.x < 1.0) {
 		return false;
 	}
-	vec3 rel = floor(bc) - cut_fill_origin;
-	if (any(lessThan(rel, vec3(0.0))) || any(greaterThanEqual(rel, cut_fill_size))) {
+	vec3 b = floor(bc);
+	float across = (cut_fill_axis < 0.5) ? b.z : b.x;
+	float along = (cut_fill_axis < 0.5) ? b.x : b.z;
+	float k = (along - cut_fill_base) * cut_fill_toward;
+	// sheared row: height, less however far the sight line has climbed by here
+	float row = b.y - floor(k * cut_fill_slope + 0.5);
+	vec2 rel = vec2(across - cut_fill_origin.x, row - cut_fill_origin.y);
+	if (any(lessThan(rel, vec2(0.0))) || any(greaterThanEqual(rel, cut_fill_size))) {
 		return false;
 	}
-	float col = mod(rel.z, cut_fill_cols);
-	float row = floor(rel.z / cut_fill_cols);
-	vec2 px = vec2(col * cut_fill_size.x + rel.x, row * cut_fill_size.y + rel.y) + 0.5;
-	vec2 uv = px / vec2(textureSize(cut_fill_tex, 0));
-	return texture(cut_fill_tex, uv).r > 0.5;
+	vec2 uv = (rel + 0.5) / vec2(textureSize(cut_fill_tex, 0));
+	float d = floor(texture(cut_fill_tex, uv).r * 255.0 + 0.5);
+	if (d < 0.5) {
+		return false;
+	}
+	return k > d - 1.0;
 }
 
 
-// An axis-aligned box of whole blocks. `bc` is a block centre, so flooring it
-// and subtracting the anchor recovers the integer offset exactly.
-bool cut_in_slab(vec3 bc) {
+// Nothing past the plane. `bc` is a block centre, so flooring it and taking the
+// step toward the lens recovers the integer offset exactly.
+bool cut_past_plane(vec3 bc) {
 	vec3 d = floor(bc) - cut_anchor;
-	float toward = dot(d, cut_toward);
-	if (toward < 1.0 || toward > cut_planar_depth) {
-		return false;
-	}
-	float lat = dot(d, cut_lateral);
-	if (lat < -cut_planar_width || lat > cut_planar_width) {
-		return false;
-	}
-	return d.y >= -cut_planar_below && d.y <= cut_planar_above;
+	return dot(d, cut_toward) >= cut_planar_depth;
 }
 
 
@@ -122,15 +124,13 @@ bool cut_is_cut(vec3 bc) {
 		return false;
 	}
 	if (cut_mode > 1.5) {
-		// The slab only removes what lies toward the lens, so the keep shell has
-		// nothing left to protect, and the cut stays a clean solid box.
-		return cut_occluded > 0.5 && cut_in_slab(bc);
+		return cut_occluded > 0.5 && cut_past_plane(bc);
+	}
+	if (cut_mode > 0.5) {
+		return cut_fill_empty < 0.5 && cut_in_front_of_pocket(bc);
 	}
 	if (cut_is_protected(bc)) {
 		return false;
-	}
-	if (cut_mode > 0.5 && cut_fill_empty < 0.5) {
-		return cut_in_fill(bc);
 	}
 	return cut_in_cylinder(bc);
 }

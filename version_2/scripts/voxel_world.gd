@@ -21,7 +21,6 @@ const SEA := 12
 ## it is centred on the player and sized to cover the lens at full zoom.
 const FILL_EXTENT := Vector3i(52, 48, 52)
 const MAX_FILL_CELLS := 3000
-const MAX_SHADOW_STEPS := 46
 const MAX_MARKED_CELLS := 26000
 
 @export var view_radius := 5
@@ -92,6 +91,8 @@ var _cap_dirty := true
 ## player crosses a block boundary or the camera swings — not every frame the
 ## way the caps are.
 var _fill_dirty := true
+## Chunks a player edit touched, remeshed next frame ahead of streaming work.
+var _edit_dirty: Array[Vector2i] = []
 var _fill_img: Image
 var _fill_tex: ImageTexture
 ## Bumped by every block write. Part of the cut signature, so mining inside a
@@ -159,6 +160,8 @@ func _init_materials() -> void:
 	mat_cap = ShaderMaterial.new()
 	mat_cap.shader = load("res://shaders/cut_cap.gdshader")
 	mat_cap.set_shader_parameter("atlas", atlas)
+	mat_cap.set_shader_parameter("atlas_tile", Vector2(
+		1.0 / float(TexGen.ATLAS_COLS), 1.0 / float(TexGen.ATLAS_ROWS)))
 
 
 # =============================================================================
@@ -289,6 +292,13 @@ func _touch(key: Vector2i) -> void:
 	if c != null and c.generated and not c.dirty:
 		c.dirty = true
 		_mesh_queue.push_front(key)
+	# An edit is not streaming work and must not queue behind it. Remember the
+	# chunk so the next frame remeshes it before anything else and outside the
+	# time budget: a block you just destroyed has to stop being drawn *now*, and
+	# under load — which in cut modes means most of the time — a budgeted queue
+	# can leave it standing for many frames. That is the ghost.
+	if c != null and c.generated and not _edit_dirty.has(key):
+		_edit_dirty.append(key)
 
 
 # =============================================================================
@@ -332,6 +342,18 @@ func _rebuild_queues() -> void:
 
 
 func _process(_delta: float) -> void:
+	# Player edits first, unbudgeted. There are at most a handful of chunks in
+	# here — a single block touches one, or three at a chunk seam — so this
+	# cannot run away, and it is what guarantees a broken block stops being
+	# drawn on the very next frame instead of whenever the streaming queue gets
+	# round to it.
+	if not _edit_dirty.is_empty():
+		for key: Vector2i in _edit_dirty:
+			var c: Chunk = _chunks.get(key)
+			if c != null and c.dirty and _neighbours_ready(key):
+				_build_chunk_mesh(c)
+		_edit_dirty.clear()
+
 	var budget := load_budget_us if not _initial_done else gen_budget_us
 	var t0 := Time.get_ticks_usec()
 
@@ -371,6 +393,17 @@ func _process(_delta: float) -> void:
 
 ## A chunk can only be meshed once its 8 neighbours exist, otherwise we would
 ## bake seams that have to be thrown away moments later.
+## A chunk can only be meshed once its eight neighbours exist, or the seams get
+## baked wrong and thrown away moments later.
+func _neighbours_ready(k: Vector2i) -> bool:
+	for dz in range(-1, 2):
+		for dx in range(-1, 2):
+			var n: Chunk = _chunks.get(k + Vector2i(dx, dz))
+			if n == null or not n.generated:
+				return false
+	return true
+
+
 func _next_meshable():
 	var i := 0
 	while i < _mesh_queue.size():
@@ -1411,155 +1444,148 @@ func _rebuild_fill() -> void:
 	var cut := cutaway
 	cut.clear_fill()
 	var target := cut.target_position
-	var cam := cut.camera_position
 
-	var origin := Vector3i(
-		floori(target.x) - FILL_EXTENT.x / 2,
-		0,
-		floori(target.z) - FILL_EXTENT.z / 2)
-	var size := Vector3i(FILL_EXTENT.x, mini(FILL_EXTENT.y, WH), FILL_EXTENT.z)
-	var cols := int(ceil(sqrt(float(size.z))))
-	var rows := int(ceil(float(size.z) / float(cols)))
-	var width := cols * size.x
-	var height := rows * size.y
-
-	var mask := PackedByteArray()
-	mask.resize(width * height)
-	mask.fill(0)
-
-	cut.fill_origin = origin
-	cut.fill_size = size
-	cut.fill_cols = cols
-	cut.fill_width = width
-	cut.fill_mask = mask
-
-	# --- 1. the pocket
-	var pocket := PackedInt32Array()
-	var queue: Array[Vector3i] = []
+	var axis := cut.plane_axis()
+	var toward := cut.plane_toward()
 	var start := Vector3i(floori(target.x), floori(target.y), floori(target.z))
-	if is_covered(start.x, start.y, start.z):
-		_seed_fill(start, queue, pocket)
-	# and where the sightline first breaks into open air, so a player wedged in a
-	# crevice still lights up the room they are looking into
-	var breach := _first_air_toward(cam, target)
-	if breach.y >= 0 and is_covered(breach.x, breach.y, breach.z):
-		_seed_fill(breach, queue, pocket)
 
-	var filled := 0
+	# --- 1. the pocket. A plain flood through covered air, which is exactly
+	# "the airspace in which the player lies" and nothing else. The cover test is
+	# what stops a doorway leaking the flood into the open sky.
+	var seen := {}
+	var pocket: Array[Vector3i] = []
+	var queue: Array[Vector3i] = [start]
+	if is_covered(start.x, start.y, start.z) and not is_solid_at(start.x, start.y, start.z):
+		seen[start] = true
+	else:
+		queue.clear()
+
+	var lo := start
+	var hi := start
 	var head := 0
-	while head < queue.size() and filled < MAX_FILL_CELLS:
+	while head < queue.size() and pocket.size() < MAX_FILL_CELLS:
 		var c: Vector3i = queue[head]
 		head += 1
-		filled += 1
+		pocket.append(c)
+		lo = Vector3i(mini(lo.x, c.x), mini(lo.y, c.y), mini(lo.z, c.z))
+		hi = Vector3i(maxi(hi.x, c.x), maxi(hi.y, c.y), maxi(hi.z, c.z))
 		for d: Vector3i in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0),
 				Vector3i(0, -1, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
-			var n := c + d
+			var n: Vector3i = c + d
+			if seen.has(n):
+				continue
+			if absi(n.x - start.x) > FILL_EXTENT.x / 2 \
+					or absi(n.z - start.z) > FILL_EXTENT.z / 2:
+				continue
 			if is_solid_at(n.x, n.y, n.z) or not is_covered(n.x, n.y, n.z):
 				continue
-			_seed_fill(n, queue, pocket)
+			seen[n] = true
+			queue.append(n)
 
 	if pocket.is_empty():
-		# no enclosed space: leave the mask empty and let the drill take over
-		cut.clear_fill()
+		# Standing in the open. There is no room to reveal, so the mode does
+		# nothing — it does not quietly turn into a drill.
 		_upload_fill(1, 1)
 		return
+
+	# --- 2. the depth mask. One byte per column of the plane across the view
+	# axis, holding how far toward the lens that column's pocket reaches. That
+	# single number is the whole occlusion test: anything further toward the lens
+	# in the same column is in the way, whatever shape the room is.
+	var across_lo := lo.z if axis == 0 else lo.x
+	var across_hi := hi.z if axis == 0 else hi.x
+	cut.fill_axis = axis
+	cut.fill_toward = toward
+	cut.fill_slope = cut.view_slope()
+	# depths count from the pocket's far side, so they start at 1 and stay small
+	cut.fill_base = (lo.x if toward > 0 else hi.x) if axis == 0 \
+		else (lo.z if toward > 0 else hi.z)
+
+	# The sheared rows the pocket occupies. It has to be measured rather than
+	# derived: the shear tilts the pocket, so its row span is not its height.
+	var row_lo := 1 << 30
+	var row_hi := -(1 << 30)
+	for c: Vector3i in pocket:
+		var along := c.x if axis == 0 else c.z
+		var r := cut.fill_row(c.y, (along - cut.fill_base) * toward)
+		row_lo = mini(row_lo, r)
+		row_hi = maxi(row_hi, r)
+
+	var size := Vector2i(across_hi - across_lo + 1, row_hi - row_lo + 1)
+	cut.fill_origin = Vector3i(across_lo, row_lo, 0)
+	cut.fill_size = size
+
+	var depth := PackedByteArray()
+	depth.resize(size.x * size.y)
+	depth.fill(0)
+	for c: Vector3i in pocket:
+		var along := c.x if axis == 0 else c.z
+		var k: int = (along - cut.fill_base) * toward
+		var u := (c.z if axis == 0 else c.x) - across_lo
+		var v := cut.fill_row(c.y, k) - row_lo
+		var i := v * size.x + u
+		if k + 1 > int(depth[i]):
+			depth[i] = mini(k + 1, 255)
+	cut.fill_depth = depth
 	cut.fill_empty = false
 
-	# --- 2. what occludes it. Only the pocket's silhouette needs to march: a
-	# cell whose neighbour toward the lens is also pocket is already covered by
-	# that neighbour's ray, so marching from it would retrace the same line.
-	var step := _camera_step(cam, target)
-	var marked := pocket.duplicate()
-	for i in pocket.size():
-		var c: Vector3i = _unpack(pocket[i])
-		var ahead := c + step
-		if cut.in_fill(ahead.x, ahead.y, ahead.z):
-			continue
-		if marked.size() > MAX_MARKED_CELLS:
-			break
-		_shadow_toward_camera(c, cam, marked)
+	# --- 3. the hidden cells, for the cross-section.
+	#
+	# The predicate hides everything in front of the pocket out to infinity, but
+	# a hidden cell can only *expose* a face if one of its neighbours is not
+	# hidden — and a neighbour is hidden exactly when the run in its own column
+	# has started. So each column only needs walking as far as the deepest of its
+	# four neighbours: past that, everything around it is gone too and there is
+	# nothing left to draw. In an open cavern that stops almost immediately and
+	# only the silhouette's rim runs the full way to the lens.
+	var reach := int(cut.camera_position.x if axis == 0 else cut.camera_position.z)
+	var far := ((reach - cut.fill_base) * toward) + 1
+	var hidden := PackedInt32Array()
+	for v in size.y:
+		for u in size.x:
+			var i := v * size.x + u
+			var d := int(depth[i])
+			if d == 0:
+				continue
+			var limit := 0
+			for n: int in [
+					i - 1 if u > 0 else -1,
+					i + 1 if u < size.x - 1 else -1,
+					i - size.x if v > 0 else -1,
+					i + size.x if v < size.y - 1 else -1]:
+				# a column with no pocket is never hidden, so it can be exposed
+				# for the whole run
+				limit = far if n < 0 else maxi(limit, int(depth[n]) - 1)
+				if limit >= far:
+					break
+			limit = mini(limit, far)
+			if limit < d:
+				continue
+			var row := row_lo + v
+			var across := across_lo + u
+			for k in range(d, limit + 1):
+				if hidden.size() >= MAX_MARKED_CELLS:
+					break
+				var along := cut.fill_base + k * toward
+				# undo the shear to get back to a real cell
+				var y := row + roundi(float(k) * cut.fill_slope)
+				if y < 0 or y >= WH:
+					continue
+				hidden.append(_pack_cell(
+					along if axis == 0 else across, y,
+					across if axis == 0 else along))
+	cut.fill_cells = hidden
+	_upload_fill(size.x, size.y)
 
-	cut.fill_cells = marked
-	_upload_fill(width, height)
 
-
-## The whole-block step from a cell toward the lens, used to walk the shadow.
-func _camera_step(cam: Vector3, target: Vector3) -> Vector3i:
-	var d := cam - target
-	if absf(d.x) >= absf(d.z):
-		return Vector3i(1 if d.x > 0.0 else -1, 0, 0)
-	return Vector3i(0, 0, 1 if d.z > 0.0 else -1)
-
-
-## Mark one cell if it is inside the box and not already marked.
-func _seed_fill(c: Vector3i, queue: Array[Vector3i], marked: PackedInt32Array,
-		expand := true) -> void:
-	var cut := cutaway
-	var lx := c.x - cut.fill_origin.x
-	var ly := c.y - cut.fill_origin.y
-	var lz := c.z - cut.fill_origin.z
-	if lx < 0 or ly < 0 or lz < 0:
-		return
-	if lx >= cut.fill_size.x or ly >= cut.fill_size.y or lz >= cut.fill_size.z:
-		return
-	var idx := cut.packed_index(lx, ly, lz)
-	if cut.fill_mask[idx] != 0:
-		return
-	cut.fill_mask[idx] = 1
-	marked.append(_pack(c))
-	if expand:
-		queue.append(c)
-
-
-func _pack(c: Vector3i) -> int:
-	var cut := cutaway
-	return ((c.z - cut.fill_origin.z) * cut.fill_size.y
-		+ (c.y - cut.fill_origin.y)) * cut.fill_size.x + (c.x - cut.fill_origin.x)
+## World cell packed into one int. Y is 6 bits, x and z 13 each with a bias, so
+## the whole streamed world fits and unpacking is two shifts.
+func _pack_cell(x: int, y: int, z: int) -> int:
+	return ((x + 4096) << 19) | ((z + 4096) << 6) | (y & 63)
 
 
 func _unpack(i: int) -> Vector3i:
-	var cut := cutaway
-	var lx := i % cut.fill_size.x
-	var rest := i / cut.fill_size.x
-	var ly := rest % cut.fill_size.y
-	var lz := rest / cut.fill_size.y
-	return Vector3i(lx, ly, lz) + cut.fill_origin
-
-
-## March from a pocket cell to the lens, marking whatever is in the way.
-##
-## Stops the moment it meets a cell some *other* ray already marked: the lens is
-## far enough away that the rays are near-parallel, so the rest of that path is
-## already done. It must not stop on a cell this same ray wrote a moment ago,
-## which is what happens if you sample finer than one block and do not say so.
-func _shadow_toward_camera(from: Vector3i, cam: Vector3, marked: PackedInt32Array) -> void:
-	var p := Vector3(from) + Vector3(0.5, 0.5, 0.5)
-	var dir := cam - p
-	var dist := dir.length()
-	if dist < 0.001:
-		return
-	dir /= dist
-	var steps := mini(int(dist / 0.5), MAX_SHADOW_STEPS)
-	var cut := cutaway
-	var last := from
-	for i in range(1, steps + 1):
-		var w := p + dir * (float(i) * 0.5)
-		var c := Vector3i(floori(w.x), floori(w.y), floori(w.z))
-		if c == last:
-			continue                    # same cell, finer sampling; not a collision
-		last = c
-		var lx := c.x - cut.fill_origin.x
-		var ly := c.y - cut.fill_origin.y
-		var lz := c.z - cut.fill_origin.z
-		if lx < 0 or ly < 0 or lz < 0:
-			return
-		if lx >= cut.fill_size.x or ly >= cut.fill_size.y or lz >= cut.fill_size.z:
-			return
-		var idx := cut.packed_index(lx, ly, lz)
-		if cut.fill_mask[idx] != 0:
-			return                      # another ray already walked this to the lens
-		cut.fill_mask[idx] = 1
-		marked.append(_pack(c))
+	return Vector3i(((i >> 19) & 8191) - 4096, i & 63, ((i >> 6) & 8191) - 4096)
 
 
 ## Is there anything solid above this cell? The flood fill only travels through
@@ -1572,25 +1598,6 @@ func is_covered(gx: int, gy: int, gz: int) -> bool:
 	return (solid_mask_at(gx, gz) >> (gy + 1)) != 0
 
 
-## Where does the line from the lens to the player first break into open air?
-func _first_air_toward(cam: Vector3, target: Vector3) -> Vector3i:
-	var to := (target + Vector3(0, 0.9, 0)) - cam
-	var dist := to.length()
-	if dist < 0.01:
-		return Vector3i(0, -1, 0)
-	var dir := to / dist
-	var seen_solid := false
-	var steps := int(dist / 0.5)
-	for i in range(steps + 1):
-		var w := cam + dir * (float(i) * 0.5)
-		var c := Vector3i(floori(w.x), floori(w.y), floori(w.z))
-		if c.y < 0 or c.y >= WH:
-			continue
-		if is_solid_at(c.x, c.y, c.z):
-			seen_solid = true
-		elif seen_solid:
-			return c                    # the far side of whatever was in the way
-	return Vector3i(0, -1, 0)
 
 
 ## Hand the packed mask to the terrain materials. One R8 image, no mipmaps, so
@@ -1599,23 +1606,26 @@ func _upload_fill(width: int, height: int) -> void:
 	var cut := cutaway
 	# The empty case is real: outdoors there is no pocket at all, and a 1x1
 	# texture still needs its one byte or the image constructor refuses it.
-	if cut.fill_mask.size() < width * height:
-		cut.fill_mask.resize(width * height)
+	if cut.fill_depth.size() < width * height:
+		cut.fill_depth.resize(width * height)
 	if _fill_img == null or _fill_img.get_width() != width \
 			or _fill_img.get_height() != height:
 		_fill_img = Image.create_from_data(width, height, false, Image.FORMAT_R8,
-			cut.fill_mask)
+			cut.fill_depth)
 		_fill_tex = ImageTexture.create_from_image(_fill_img)
 	else:
-		_fill_img.set_data(width, height, false, Image.FORMAT_R8, cut.fill_mask)
+		_fill_img.set_data(width, height, false, Image.FORMAT_R8, cut.fill_depth)
 		_fill_tex.update(_fill_img)
 	for mat in [mat_opaque, mat_glass, mat_cross, mat_cap]:
 		if mat == null:
 			continue
 		mat.set_shader_parameter("cut_fill_tex", _fill_tex)
 		mat.set_shader_parameter("cut_fill_origin", Vector3(cut.fill_origin))
-		mat.set_shader_parameter("cut_fill_size", Vector3(cut.fill_size))
-		mat.set_shader_parameter("cut_fill_cols", float(cut.fill_cols))
+		mat.set_shader_parameter("cut_fill_size", Vector2(cut.fill_size))
+		mat.set_shader_parameter("cut_fill_axis", float(cut.fill_axis))
+		mat.set_shader_parameter("cut_fill_toward", float(cut.fill_toward))
+		mat.set_shader_parameter("cut_fill_base", float(cut.fill_base))
+		mat.set_shader_parameter("cut_fill_slope", cut.fill_slope)
 
 
 ## Walks the boundary of the cut volume and emits every face that the discard in
@@ -1632,9 +1642,10 @@ func _rebuild_caps() -> void:
 	var caps: Array = []
 	if cut.mode == Cutaway.Mode.PLANAR:
 		if cut.occluded:
-			_caps_from_slab(caps)
-	elif cut.mode == Cutaway.Mode.FILL and not cut.fill_cells.is_empty():
-		_caps_from_cells(caps)
+			_caps_from_plane(caps)
+	elif cut.mode == Cutaway.Mode.FILL:
+		if not cut.fill_cells.is_empty():
+			_caps_from_cells(caps)
 	else:
 		_caps_from_bounds(caps)
 
@@ -1648,57 +1659,56 @@ func _rebuild_caps() -> void:
 	_cap_mi.mesh = mesh
 
 
-## The planar slab is a solid axis-aligned box of voxels, so the only cut cells
-## with an uncut neighbour are the ones on its boundary. Walking the five
-## outward faces is O(surface) instead of O(volume) — for the default slab that
-## is about 1,200 cells rather than 25,000, and it only happens when the box
-## itself moves.
-func _caps_from_slab(caps: Array) -> void:
+## The cross-section of a half-space is one flat plane, so that is all this
+## builds: a single slice of faces, one per solid cell on the last slice that is
+## still drawn, all facing the lens.
+##
+## Nothing else can be exposed. Everything past the plane is gone and everything
+## behind it is untouched, so the only newly bare surfaces in the entire world
+## are on that one plane. The old box cut had five faces to walk and about 1,200
+## cells to test; this walks one slice, reads it a whole column at a time out of
+## the solid bitmask, and merges vertical runs of the same block into single
+## quads — which underground collapses a 48-block column into one or two.
+func _caps_from_plane(caps: Array) -> void:
 	var cut := cutaway
 	var cam := cut.camera_position
-	var t := cut.toward_camera()
-	var l := cut.lateral_axis()
-	var w := cut.planar_half_width
-	var d0 := 1
-	var d1 := cut.planar_depth
-	var y0 := cut.anchor.y - cut.planar_below
-	var y1 := cut.anchor.y + cut.planar_above
+	var axis := cut.plane_axis()
+	var plane := cut.plane_coord()
+	var dir := dir_index(-cut.toward_camera())
+	var centre := cut.plane_across()
+	var reach := cut.planar_cap_reach
 
-	# the two depth end-caps: nearest to the player, and the far wall
-	for lat: int in range(-w, w + 1):
-		for y: int in range(maxi(y0, 0), mini(y1 + 1, WH)):
-			_cap_boundary(caps, cut.anchor + t * d0 + l * lat + Vector3i(0, y - cut.anchor.y, 0),
-				-t, cam)
-			_cap_boundary(caps, cut.anchor + t * d1 + l * lat + Vector3i(0, y - cut.anchor.y, 0),
-				t, cam)
-
-	# the two lateral walls
-	for depth: int in range(d0, d1 + 1):
-		for y: int in range(maxi(y0, 0), mini(y1 + 1, WH)):
-			var dy := Vector3i(0, y - cut.anchor.y, 0)
-			_cap_boundary(caps, cut.anchor + t * depth + l * -w + dy, -l, cam)
-			_cap_boundary(caps, cut.anchor + t * depth + l * w + dy, l, cam)
-
-	# floor and ceiling
-	for depth: int in range(d0, d1 + 1):
-		for lat: int in range(-w, w + 1):
-			var base := cut.anchor + t * depth + l * lat
-			if y0 - 1 >= 0:
-				_cap_boundary(caps, Vector3i(base.x, y0, base.z), Vector3i(0, -1, 0), cam)
-			if y1 + 1 < WH:
-				_cap_boundary(caps, Vector3i(base.x, y1, base.z), Vector3i(0, 1, 0), cam)
-
-
-## One boundary cell of a box cut: if the neighbour just outside is solid, that
-## neighbour has a newly exposed face.
-func _cap_boundary(caps: Array, cell: Vector3i, outward: Vector3i, cam: Vector3) -> void:
-	var n := cell + outward
-	if n.y < 0 or n.y >= WH:
-		return
-	var id := get_block(n.x, n.y, n.z)
-	if id == Blocks.AIR or not Blocks.is_opaque(id):
-		return
-	_cap_face(caps, n, dir_index(-outward), Vector3(cell).distance_to(cam))
+	for offset in range(-reach, reach + 1):
+		var gx := plane if axis == 0 else centre + offset
+		var gz := centre + offset if axis == 0 else plane
+		var mask := solid_mask_at(gx, gz)
+		if mask == 0:
+			continue
+		# Fetch the column once. `get_block` re-resolves the chunk on every
+		# call, and at forty-eight cells a column across a hundred columns that
+		# lookup is the whole cost of the rebuild.
+		var c: Chunk = _chunks.get(Vector2i(gx >> 4, gz >> 4))
+		if c == null:
+			continue
+		var base := ((gx & 15) * CW + (gz & 15)) * WH
+		var y := 0
+		while y < WH:
+			if (mask >> y) & 1 == 0:
+				y += 1
+				continue
+			# how far the run of the *same* block carries upward
+			var id: int = c.types[base + y]
+			var top := y + 1
+			while top < WH and (mask >> top) & 1 != 0 \
+					and c.types[base + top] == id:
+				top += 1
+			if Blocks.is_opaque(id):
+				var ao := clampf(1.0 - Vector3(gx, y, gz).distance_to(cam) * 0.02,
+					0.62, 1.0)
+				caps.append(Vector3i(gx, y, gz))
+				caps.append(dir | (int(ao * 255.0) << 8) | (id << 16)
+					| ((top - y) << 24))
+			y = top
 
 
 func _caps_from_bounds(caps: Array) -> void:
@@ -1770,7 +1780,7 @@ func _cap_face(caps: Array, cell: Vector3i, dir: int, dist: float) -> void:
 	# darken with distance so a deep slice reads as depth, not as a flat wall
 	var ao := clampf(1.0 - dist * 0.02, 0.62, 1.0)
 	caps.append(cell)
-	caps.append(dir | (int(ao * 255.0) << 8) | (id << 16))
+	caps.append(dir | (int(ao * 255.0) << 8) | (id << 16) | (1 << 24))
 
 
 func _cap_arrays(caps: Array) -> Array:
@@ -1778,11 +1788,13 @@ func _cap_arrays(caps: Array) -> Array:
 	var verts := PackedVector3Array()
 	var norms := PackedVector3Array()
 	var uvs := PackedVector2Array()
+	var uv2s := PackedVector2Array()
 	var cols := PackedColorArray()
 	var idx := PackedInt32Array()
 	verts.resize(n * 4)
 	norms.resize(n * 4)
 	uvs.resize(n * 4)
+	uv2s.resize(n * 4)
 	cols.resize(n * 4)
 	idx.resize(n * 6)
 
@@ -1797,20 +1809,24 @@ func _cap_arrays(caps: Array) -> Array:
 		var dir := packed & 255
 		var ao := float((packed >> 8) & 255) / 255.0
 		var id := (packed >> 16) & 255
+		var run := maxi((packed >> 24) & 255, 1)
 		var tile := Blocks.tile_of(id, dir)
 		var origin := Vector3(cell)
 		var nrm: Vector3 = FACE_NORMAL[dir]
 		var vt: Array = FACE_VERTS[dir]
 		var u0 := float(tile % TexGen.ATLAS_COLS) * tw + eps
 		var v0 := float(tile / TexGen.ATLAS_COLS) * th + eps
-		var uw := tw - eps * 2.0
-		var vh := th - eps * 2.0
 		var emis := Blocks.emission(id)
 		for j in 4:
-			verts[vi + j] = origin + vt[j]
+			# a merged run is one quad `run` cells tall; the shader repeats the
+			# block's atlas tile across it rather than stretching it
+			var corner: Vector3 = vt[j]
+			verts[vi + j] = origin + Vector3(corner.x,
+				corner.y * float(run), corner.z)
 			norms[vi + j] = nrm
 			var uv: Vector2 = FACE_UV[j]
-			uvs[vi + j] = Vector2(u0 + uv.x * uw, v0 + uv.y * vh)
+			uvs[vi + j] = Vector2(uv.x, uv.y * float(run))
+			uv2s[vi + j] = Vector2(u0, v0)
 			cols[vi + j] = Color(ao, emis, 1.0, 1.0)
 		idx[ii] = vi; idx[ii + 1] = vi + 2; idx[ii + 2] = vi + 1
 		idx[ii + 3] = vi; idx[ii + 4] = vi + 3; idx[ii + 5] = vi + 2
@@ -1822,6 +1838,7 @@ func _cap_arrays(caps: Array) -> Array:
 	arr[Mesh.ARRAY_VERTEX] = verts
 	arr[Mesh.ARRAY_NORMAL] = norms
 	arr[Mesh.ARRAY_TEX_UV] = uvs
+	arr[Mesh.ARRAY_TEX_UV2] = uv2s
 	arr[Mesh.ARRAY_COLOR] = cols
 	arr[Mesh.ARRAY_INDEX] = idx
 	return arr

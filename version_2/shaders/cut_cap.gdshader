@@ -14,6 +14,9 @@ render_mode cull_back, diffuse_lambert, specular_disabled;
 // "highlights the tunnel" you just walked into.
 
 uniform sampler2D atlas : source_color, filter_nearest;
+// Atlas geometry, so a merged face can repeat its own tile instead of
+// stretching it. UV carries the repeat count (0..run), UV2 the tile's corner.
+uniform vec2 atlas_tile = vec2(0.05, 0.05);
 uniform vec3 slice_tint : source_color = vec3(0.20, 0.17, 0.22);
 uniform float slice_mix : hint_range(0.0, 1.0) = 0.34;
 uniform float grid_strength : hint_range(0.0, 1.0) = 0.09;
@@ -34,7 +37,12 @@ void vertex() {
 }
 
 void fragment() {
-	vec4 t = texture(atlas, UV);
+	// One quad may stand for a whole vertical run of identical blocks, so the
+	// tile repeats along it rather than stretching. The inset keeps the sample
+	// off the atlas seam, which is why this cannot just be a repeat sampler.
+	vec2 eps = atlas_tile * 0.02;
+	vec2 auv = UV2 + eps + fract(UV) * (atlas_tile - eps * 2.0);
+	vec4 t = texture(atlas, auv);
 	float ao = COLOR.r;
 
 	// Sedimentary banding so a deep cut reads as strata rather than mush.

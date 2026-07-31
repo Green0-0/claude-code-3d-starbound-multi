@@ -21,10 +21,15 @@ extends RefCounted
 ##      just walked up to do not evaporate as you approach them.
 ##   2. **The mode**:
 ##      * `CYLINDER` — a drill from the lens to the player.
-##      * `FILL` — the enclosed air pocket you are standing in, and only what
-##        occludes it. Reveals a whole tunnel or a whole room, and nothing else.
-##      * `PLANAR` — an axis-aligned box of voxels in front of you, while you
-##        are genuinely covered.
+##      * `FILL` — the air pocket you are standing in, with everything between
+##        that pocket and the lens removed. No drill, no cone, no rays.
+##      * `PLANAR` — a half-space: nothing past a coordinate plane just in front
+##        of you is drawn at all, while you are genuinely covered.
+##
+## The keep shell and the cylinder belong to `CYLINDER` alone. The other two
+## modes answer a question about the world — "what room am I in", "what is on
+## the near side of this plane" — and a drill mixed into either of them only
+## makes the answer wrong.
 ##
 ## Cut blocks are deleted, or drawn as ghosts that fade with distance.
 ## ---------------------------------------------------------------------------
@@ -65,25 +70,41 @@ var keep_radius := 2.75
 var keep_bias := 0.35
 
 # --------------------------------------------------------------------- planar
-## The slab, in whole blocks, measured from the player's own cell.
-var planar_depth := 34
-var planar_half_width := 5
-var planar_below := 1
-var planar_above := 4
+## How far in front of the player's own cell the plane sits. One block: the cut
+## begins at the first cell between you and the lens.
+var planar_offset := 1
+## How wide a window of the plane the cross-section is built for, either side of
+## the player. Only the cap cares; the predicate itself is unbounded.
+var planar_cap_reach := 56
 
 # ----------------------------------------------------------------------- fill
-var fill_origin := Vector3i.ZERO
-var fill_size := Vector3i.ZERO
-## Packed as a grid of z-slices, the same layout the shader samples, so the mask
-## goes to the GPU without a repacking pass.
-var fill_mask := PackedByteArray()
-var fill_cols := 1
-var fill_width := 0
-## Every marked cell, packed, so the cap builder can walk the set instead of the
-## volume that contains it.
-var fill_cells := PackedInt32Array()
-## True when the player is in open air and the fill found nothing to work with.
+##
+## The pocket is described by a *depth mask* rather than by a marked volume:
+## one entry per column of the plane perpendicular to the view axis, holding how
+## far toward the lens that column's air pocket reaches. A block is hidden when
+## it stands in front of that. One comparison, no marching, and the mask is two
+## dimensional instead of three.
+var fill_origin := Vector3i.ZERO      ## world corner of the mask window
+var fill_size := Vector2i.ZERO        ## across, up
+## depth + 1 for each column, 0 where the pocket does not reach.
+var fill_depth := PackedByteArray()
+## Which world axis the view runs along (0 = x, 2 = z) and which way the lens is.
+var fill_axis := 2
+var fill_toward := 1
+## Where the mask's depth values are measured from.
+var fill_base := 0
+## How far the sight line climbs per block of depth toward the lens.
+##
+## Without this the mask is wrong in the one way that matters. The lens looks
+## *down* at thirty-odd degrees, so a block that hides the room is not in the
+## room's own row — it is fifteen rows above it and twenty blocks nearer. Shear
+## the mask by the slope and the occluder and the thing it occludes land in the
+## same column again, which is the whole premise of a depth mask.
+var fill_slope := 0.0
+## True when no enclosed pocket was found; the mode then does nothing at all.
 var fill_empty := true
+## Every hidden cell, so the cap builder can walk the set rather than a volume.
+var fill_cells := PackedInt32Array()
 
 # ------------------------------------------------------------- presentation
 var opacity := 0.0
@@ -154,15 +175,14 @@ func is_cut(bx: int, by: int, bz: int) -> bool:
 	if not enabled:
 		return false
 	if mode == Mode.PLANAR:
-		# The slab already only removes what lies toward the lens, so the keep
-		# shell has nothing left to protect — and leaving it out is what makes
-		# the cut a solid box, which is what makes the caps cheap.
-		return occluded and in_slab(bx, by, bz)
+		return occluded and past_plane(bx, by, bz)
+	if mode == Mode.FILL:
+		# No pocket means no cut. Falling back to the drill here is what made
+		# this mode feel like the cylinder wearing a hat.
+		return not fill_empty and in_front_of_pocket(bx, by, bz)
 	var bc := Vector3(bx + 0.5, by + 0.5, bz + 0.5)
 	if is_protected(bc):
 		return false
-	if mode == Mode.FILL and not fill_empty:
-		return in_fill(bx, by, bz)
 	return in_cylinder(bc)
 
 
@@ -202,57 +222,70 @@ func in_cylinder(bc: Vector3) -> bool:
 	return bc.distance_squared_to(closest) <= er * er
 
 
-func in_fill(bx: int, by: int, bz: int) -> bool:
-	if fill_mask.is_empty():
+## Is this block standing between the lens and the room the player is in?
+##
+## The mask holds, per column of the view plane, how far toward the lens that
+## column's pocket reaches. Anything in the same column and further toward the
+## lens than that is in the way. Two integer compares and one byte fetch.
+func in_front_of_pocket(bx: int, by: int, bz: int) -> bool:
+	if fill_depth.is_empty():
 		return false
-	var lx := bx - fill_origin.x
-	var ly := by - fill_origin.y
-	var lz := bz - fill_origin.z
-	if lx < 0 or ly < 0 or lz < 0:
+	var across := bz if fill_axis == 0 else bx
+	var along := bx if fill_axis == 0 else bz
+	var k := (along - fill_base) * fill_toward
+	var u := across - fill_origin.x
+	var v := fill_row(by, k) - fill_origin.y
+	if u < 0 or v < 0 or u >= fill_size.x or v >= fill_size.y:
 		return false
-	if lx >= fill_size.x or ly >= fill_size.y or lz >= fill_size.z:
+	var d: int = fill_depth[v * fill_size.x + u]
+	if d == 0:
 		return false
-	return fill_mask[packed_index(lx, ly, lz)] != 0
+	return k > d - 1
 
 
-## Index into the z-slice grid. Mirrored exactly in cutaway.gdshaderinc.
-func packed_index(lx: int, ly: int, lz: int) -> int:
-	var col := lz % fill_cols
-	var row := lz / fill_cols
-	return (row * fill_size.y + ly) * fill_width + (col * fill_size.x + lx)
+## The sheared row a cell falls in: its height, less however far the sight line
+## has climbed by that depth. Mirrored exactly in the shader.
+func fill_row(by: int, k: int) -> int:
+	return by - roundi(float(k) * fill_slope)
 
 
-## An axis-aligned box of whole blocks in front of the player. Pure integer
-## arithmetic — no square roots, no normalising, no per-cell vector maths.
-func in_slab(bx: int, by: int, bz: int) -> bool:
+## Nothing past the plane, full stop.
+##
+## This is the whole of planar mode. It is a half-space bounded by one
+## axis-aligned coordinate plane sitting `planar_offset` cells in front of the
+## player's own cell, and it has no lateral, vertical or far bound whatsoever —
+## which is both what "do not render anything past a coordinate plane" means and
+## the reason the mode is now free. The cut set depends on one integer. Walking
+## sideways or up and down does not change it, so nothing downstream rebuilds.
+func past_plane(bx: int, by: int, bz: int) -> bool:
 	var t := toward_camera()
-	var l := lateral_axis()
-	var dx := bx - anchor.x
-	var dy := by - anchor.y
-	var dz := bz - anchor.z
-	var toward := dx * t.x + dz * t.z
-	if toward < 1 or toward > planar_depth:
-		return false
-	var lat := dx * l.x + dz * l.z
-	if lat < -planar_half_width or lat > planar_half_width:
-		return false
-	return dy >= -planar_below and dy <= planar_above
+	if t.x != 0:
+		return (bx - anchor.x) * t.x >= planar_offset
+	return (bz - anchor.z) * t.z >= planar_offset
 
 
-## The slab as an integer AABB, which is all the cap builder needs.
-func slab_bounds() -> AABB:
+## 0 when the view runs along x, 2 when it runs along z.
+func plane_axis() -> int:
+	return 0 if toward_camera().x != 0 else 2
+
+
+## Which way the lens lies along that axis, as +1 or -1.
+func plane_toward() -> int:
 	var t := toward_camera()
-	var l := lateral_axis()
-	var lo := anchor
-	var hi := anchor
-	for corner_t: int in [1, planar_depth]:
-		for corner_l: int in [-planar_half_width, planar_half_width]:
-			var c := anchor + t * corner_t + l * corner_l
-			lo = Vector3i(mini(lo.x, c.x), lo.y, mini(lo.z, c.z))
-			hi = Vector3i(maxi(hi.x, c.x), hi.y, maxi(hi.z, c.z))
-	lo.y = anchor.y - planar_below
-	hi.y = anchor.y + planar_above
-	return AABB(Vector3(lo), Vector3(hi - lo + Vector3i.ONE))
+	return t.x if t.x != 0 else t.z
+
+
+## The world coordinate of the last slice that is still drawn. The cross-section
+## stands on this plane.
+func plane_coord() -> int:
+	var axis := plane_axis()
+	var a := anchor.x if axis == 0 else anchor.z
+	return a + (planar_offset - 1) * plane_toward()
+
+
+## The player's coordinate across the plane, which is all the cap window follows.
+func plane_across() -> int:
+	return anchor.z if plane_axis() == 0 else anchor.x
 
 
 # =============================================================================
@@ -280,34 +313,59 @@ func mode_name() -> String:
 
 ## Everything the cut set depends on, in one comparable value. While this has
 ## not changed, neither has the cross-section, and the cached mesh stands.
+##
+## Each mode gets only the terms it actually depends on, and that is the whole
+## performance story of this system:
+##
+##   PLANAR depends on one integer — which plane. Walking across the plane or up
+##     and down it changes nothing, so the great majority of ordinary movement
+##     costs nothing at all. Only the cap *window* follows the player, and it is
+##     quantised to a chunk so it moves once every sixteen blocks.
+##   FILL depends on which room you are in, not where you stand in it, so the
+##     flood is quantised to four blocks. The lens cell drops out entirely: the
+##     mask is built along the facing axis and the facing is already a term.
+##   CYLINDER genuinely is a line from the lens to the player, so it needs both.
 func signature(world_version: int) -> String:
-	return "%d|%d,%d,%d|%d,%d,%d|%d|%d|%d|%d|%d" % [
-		mode, anchor.x, anchor.y, anchor.z, cam_cell.x, cam_cell.y, cam_cell.z,
-		facing, int(occluded), int(enabled), int(opacity > 0.0), world_version]
+	var head := "%d|%d|%d|%d|%d|%d" % [mode, facing, int(occluded), int(enabled),
+		int(opacity > 0.0), world_version]
+	match mode:
+		Mode.PLANAR:
+			return "%s|P%d|%d,%d" % [head, plane_coord(),
+				plane_across() >> 4, anchor.y >> 4]
+		Mode.FILL:
+			return "%s|F%d,%d,%d|%.3f" % [head, anchor.x >> 2, anchor.y >> 2,
+				anchor.z >> 2, view_slope()]
+	return "%s|C%d,%d,%d|%d,%d,%d" % [head, anchor.x, anchor.y, anchor.z,
+		cam_cell.x, cam_cell.y, cam_cell.z]
 
 
 func get_int_bounds() -> AABB:
-	if mode == Mode.PLANAR:
-		return slab_bounds()
 	var pad := radius + target_padding + keep_radius
 	var min_pos := camera_position.min(target_position) - Vector3(pad, pad, pad)
 	var max_pos := camera_position.max(target_position) + Vector3(pad, pad, pad)
-	if mode == Mode.FILL and fill_size.x > 0:
-		min_pos = min_pos.min(Vector3(fill_origin))
-		max_pos = max_pos.max(Vector3(fill_origin + fill_size))
 	var min_i := Vector3i(floori(min_pos.x), floori(min_pos.y), floori(min_pos.z))
 	var max_i := Vector3i(ceili(max_pos.x), ceili(max_pos.y), ceili(max_pos.z))
 	return AABB(min_i, max_i - min_i)
 
 
 func clear_fill() -> void:
-	fill_mask = PackedByteArray()
+	fill_depth = PackedByteArray()
 	fill_cells = PackedInt32Array()
-	fill_size = Vector3i.ZERO
+	fill_size = Vector2i.ZERO
 	fill_origin = Vector3i.ZERO
-	fill_cols = 1
-	fill_width = 0
+	fill_axis = 2
+	fill_toward = 1
+	fill_base = 0
+	fill_slope = 0.0
 	fill_empty = true
+
+
+## The sight line's rise per block of depth, quantised so it does not churn the
+## signature. The pitch is fixed, so in practice this is a constant.
+func view_slope() -> float:
+	var d := camera_position - target_position
+	var horiz := absf(d.x if plane_axis() == 0 else d.z)
+	return snappedf(d.y / maxf(horiz, 1.0), 0.125)
 
 
 func push_to_shader_globals() -> void:
@@ -324,10 +382,7 @@ func push_to_shader_globals() -> void:
 	RenderingServer.global_shader_parameter_set(&"cut_keep_bias", float(keep_bias))
 	RenderingServer.global_shader_parameter_set(&"cut_opacity", float(opacity))
 	RenderingServer.global_shader_parameter_set(&"cut_fade", float(fade_distance))
-	RenderingServer.global_shader_parameter_set(&"cut_planar_depth", float(planar_depth))
-	RenderingServer.global_shader_parameter_set(&"cut_planar_width", float(planar_half_width))
-	RenderingServer.global_shader_parameter_set(&"cut_planar_below", float(planar_below))
-	RenderingServer.global_shader_parameter_set(&"cut_planar_above", float(planar_above))
+	RenderingServer.global_shader_parameter_set(&"cut_planar_depth", float(planar_offset))
 	RenderingServer.global_shader_parameter_set(&"cut_occluded", 1.0 if occluded else 0.0)
 	RenderingServer.global_shader_parameter_set(&"cut_fill_empty", 1.0 if fill_empty else 0.0)
 
