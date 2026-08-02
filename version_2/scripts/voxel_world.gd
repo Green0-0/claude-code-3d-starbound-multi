@@ -85,12 +85,13 @@ var mat_cap: ShaderMaterial
 
 var cutaway := Cutaway.new()
 var _cap_mi: MeshInstance3D
-var _cap_dirty := true
+## Kept and refilled rather than replaced, so a rebuild does not churn an RID.
+var _cap_mesh := ArrayMesh.new()
+## The cross-section under construction: one entry per quad in each. Typed and
+## reused so a rebuild does not box a few thousand Variants on the way to a mesh.
+var _cap_cells := PackedVector3Array()
+var _cap_meta := PackedInt32Array()
 
-## The flood-fill volume is expensive to rebuild, so it is only redone when the
-## player crosses a block boundary or the camera swings — not every frame the
-## way the caps are.
-var _fill_dirty := true
 ## Chunks a player edit touched, remeshed next frame ahead of streaming work.
 var _edit_dirty: Array[Vector2i] = []
 var _fill_img: Image
@@ -99,8 +100,14 @@ var _fill_tex: ImageTexture
 ## cross-section rebuilds it on the same frame instead of leaving the old
 ## geometry hanging in the air.
 var _world_version := 0
-## The signature the cached cap mesh was built for.
-var _cut_sig := ""
+## The signature the cached cap mesh was built for, in three parts. Held as
+## integer vectors rather than a formatted string because this is compared on
+## every single frame; see Cutaway.sig_head.
+var _cut_head := Vector4i(-1, -1, -1, -1)
+var _cut_lo := Vector4i.ZERO
+var _cut_hi := Vector4i.ZERO
+## Which chunks the planar cull currently hides; see Cutaway.planar_cull_key.
+var _cull_key := Vector3i.ZERO
 ## How many times the cross-section has actually been rebuilt. Standing still
 ## must not increment this.
 var cut_rebuilds := 0
@@ -137,6 +144,7 @@ func _ready() -> void:
 	_cap_mi = MeshInstance3D.new()
 	_cap_mi.name = "CutawayCaps"
 	_cap_mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	_cap_mi.mesh = _cap_mesh
 	add_child(_cap_mi)
 
 	cutaway.push_to_shader_globals()
@@ -256,6 +264,7 @@ func set_block(gx: int, gy: int, gz: int, id: int, mark_dirty := true) -> bool:
 	var idx := ci * WH + gy
 	if c.types[idx] == id:
 		return false
+	var was := c.types[idx]
 	c.types[idx] = id
 	var bit := 1 << gy
 	if id == Blocks.AIR:
@@ -272,7 +281,19 @@ func set_block(gx: int, gy: int, gz: int, id: int, mark_dirty := true) -> bool:
 			c.coll[ci] |= bit
 		else:
 			c.coll[ci] &= ~bit
-	_world_version += 1
+	# Only bump the version the cut watches when the write could actually have
+	# changed the cross-section. Every cap the three modes build is an opaque
+	# block's face, and the fill's flood travels by the collision mask, so a
+	# write that touches neither cannot move a single vertex.
+	#
+	# This is not a micro-saving. Liquid flow and crop growth write blocks on
+	# their own timers, several a second, forever — and with the version bumped
+	# unconditionally, standing beside a waterfall rebuilt the whole slice on
+	# every frame that water moved. Neither water nor wheat is opaque, so
+	# neither one now costs anything.
+	if Blocks.is_opaque(was) or Blocks.is_opaque(id) \
+			or Blocks.is_solid(was) != Blocks.is_solid(id):
+		_world_version += 1
 	if mark_dirty:
 		_touch(key)
 		if lx == 0:
@@ -283,7 +304,6 @@ func set_block(gx: int, gy: int, gz: int, id: int, mark_dirty := true) -> bool:
 			_touch(key + Vector2i(0, -1))
 		elif lz == CW - 1:
 			_touch(key + Vector2i(0, 1))
-		_cap_dirty = true
 	return true
 
 
@@ -377,18 +397,7 @@ func _process(_delta: float) -> void:
 			_initial_done = true
 			world_ready.emit()
 
-	# One signature governs the whole cut. While it holds, the cross-section is
-	# unchanged and there is nothing at all to do — which is the point of
-	# quantising the predicate to voxel coordinates in the first place.
-	var sig := cutaway.signature(_world_version)
-	if sig != _cut_sig:
-		_cut_sig = sig
-		cut_rebuilds += 1
-		if cutaway.enabled and cutaway.mode == Cutaway.Mode.FILL:
-			_rebuild_fill()
-		_rebuild_caps()
-		_fill_dirty = false
-		_cap_dirty = false
+	refresh_cutaway()
 
 
 ## A chunk can only be meshed once its 8 neighbours exist, otherwise we would
@@ -461,7 +470,12 @@ func load_planet(cfg: Dictionary) -> void:
 	_initial_done = false
 	_initial_total = 1
 	_live = false
-	_cap_dirty = true
+	# A new planet is a new world under the same cross-section. Nothing bumps
+	# _world_version — generation writes chunk arrays directly rather than going
+	# through set_block — so without this the old slice hangs in the air until
+	# the player happens to cross a block boundary.
+	_invalidate_cut()
+	_cull_key = Vector3i.ZERO
 
 
 func _generate_chunk(key: Vector2i) -> void:
@@ -1201,6 +1215,9 @@ func _build_chunk_mesh(ch: Chunk) -> void:
 		ch.mi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 		add_child(ch.mi)
 	ch.mi.mesh = mesh if added > 0 else null
+	# A chunk that streams in behind the plane must arrive already hidden, or it
+	# pops into view for however long it takes the player to cross a boundary.
+	ch.mi.visible = not cutaway.planar_chunk_hidden(ch.cx, ch.cz)
 
 
 ## Two quads crossed at 90° per cell. `COLOR.b` carries the vertex's height up
@@ -1363,8 +1380,69 @@ func update_cutaway(cam_pos: Vector3, target_pos: Vector3) -> void:
 	# stay dormant in the open. One raycast per block crossing, not per frame.
 	if cutaway.mode == Cutaway.Mode.PLANAR:
 		cutaway.occluded = _is_occluded(cam_pos, target_pos)
-	_fill_dirty = true
-	_cap_dirty = true
+
+
+## Rebuild the cross-section if — and only if — something it depends on changed.
+## Returns true when it actually rebuilt.
+##
+## One signature governs the whole cut. While it holds, the cross-section is
+## unchanged and there is nothing at all to do, which is the point of quantising
+## the predicate to voxel coordinates in the first place. Comparing it costs
+## three integer-vector compares and allocates nothing, so the frame on which
+## the player does not cross a block boundary is genuinely free.
+func refresh_cutaway() -> bool:
+	var head := cutaway.sig_head(_world_version)
+	var lo := cutaway.sig_lo()
+	var hi := cutaway.sig_hi()
+	if head == _cut_head and lo == _cut_lo and hi == _cut_hi:
+		return false
+	_cut_head = head
+	_cut_lo = lo
+	_cut_hi = hi
+	cut_rebuilds += 1
+	if cutaway.enabled and cutaway.mode == Cutaway.Mode.FILL:
+		_rebuild_fill()
+	_rebuild_caps()
+	_apply_chunk_visibility()
+	return true
+
+
+## Force the next `refresh_cutaway` to rebuild whatever the player did.
+func _invalidate_cut() -> void:
+	_cut_head = Vector4i(-1, -1, -1, -1)
+
+
+## Hide the chunks that lie wholly past the plane.
+##
+## Their fragments are all discarded anyway, but a discarded fragment has still
+## been transformed, rasterised and shaded up to the point of the `discard`, and
+## the chunk has still been submitted to the shadow pass. In planar mode about
+## half the streamed world is on the far side of the plane, and this is the only
+## saving in the whole system that grows with view distance instead of with the
+## size of the cross-section.
+##
+## The early return is not an optimisation so much as the price of admission.
+## Sweeping every loaded chunk costs about two milliseconds — `Node3D.visible`
+## propagates through a subtree and emits a signal, so it is nothing like a
+## field write — and doing that on every step along the view axis cost more than
+## the cross-section rebuild it was meant to accompany. The threshold only moves
+## once every sixteen blocks, and while it holds no chunk can have changed side.
+func _apply_chunk_visibility() -> void:
+	var key := cutaway.planar_cull_key()
+	if key == _cull_key:
+		return
+	_cull_key = key
+	var axis_x := key.x == 1
+	for k: Vector2i in _chunks:
+		var c: Chunk = _chunks[k]
+		if c.mi == null:
+			continue
+		var want := true
+		if key.x != 0:
+			var cc := k.x if axis_x else k.y
+			want = not (cc >= key.z if key.y > 0 else cc <= key.z)
+		if c.mi.visible != want:
+			c.mi.visible = want
 
 
 func set_cutaway_mode(m: int) -> void:
@@ -1374,7 +1452,7 @@ func set_cutaway_mode(m: int) -> void:
 	cutaway.clear_fill()
 	if m == Cutaway.Mode.PLANAR:
 		cutaway.occluded = _is_occluded(cutaway.camera_position, cutaway.target_position)
-	_cut_sig = ""
+	_invalidate_cut()
 
 
 ## Is the straight line from the lens to the player actually blocked? Only the
@@ -1392,14 +1470,14 @@ func set_cutaway_enabled(v: bool) -> void:
 	if cutaway.enabled == v:
 		return
 	cutaway.enabled = v
-	_cut_sig = ""
+	_invalidate_cut()
 
 
 ## Ghost opacity and the mine-through toggle. Both are pure presentation, but
 ## the caps change with them, so they go through here.
 func set_cutaway_opacity(v: float) -> void:
 	cutaway.opacity = clampf(v, 0.0, 1.0)
-	_cut_sig = ""
+	_invalidate_cut()
 
 
 func set_cutaway_selectable(v: bool) -> void:
@@ -1408,7 +1486,7 @@ func set_cutaway_selectable(v: bool) -> void:
 
 ## True while the world is actually being sliced open for the camera.
 func has_cutaway_geometry() -> bool:
-	return _cap_mi != null and _cap_mi.mesh != null
+	return _cap_mesh.get_surface_count() > 0
 
 
 static func dir_index(v: Vector3i) -> int:
@@ -1631,37 +1709,42 @@ func _upload_fill(width: int, height: int) -> void:
 ## Walks the boundary of the cut volume and emits every face that the discard in
 ## voxel.gdshader just exposed. Without this you would be looking at the inside
 ## of the terrain shell, which has no geometry at all.
+##
+## The one `ArrayMesh` is kept and its surface replaced rather than a new mesh
+## being built each time, so a rebuild does not churn a rendering-server RID.
 func _rebuild_caps() -> void:
 	var cut := cutaway
 	cut.push_to_shader_globals()
+	_cap_cells.clear()
+	_cap_meta.clear()
 
-	if not cut.enabled:
-		_cap_mi.mesh = null
+	if cut.enabled:
+		if cut.mode == Cutaway.Mode.PLANAR:
+			if cut.occluded:
+				_caps_from_plane()
+		elif cut.mode == Cutaway.Mode.FILL:
+			if not cut.fill_cells.is_empty():
+				_caps_from_cells()
+		else:
+			_caps_from_bounds()
+
+	_cap_mesh.clear_surfaces()
+	if _cap_cells.is_empty():
 		return
-
-	var caps: Array = []
-	if cut.mode == Cutaway.Mode.PLANAR:
-		if cut.occluded:
-			_caps_from_plane(caps)
-	elif cut.mode == Cutaway.Mode.FILL:
-		if not cut.fill_cells.is_empty():
-			_caps_from_cells(caps)
-	else:
-		_caps_from_bounds(caps)
-
-	if caps.is_empty():
-		_cap_mi.mesh = null
-		return
-
-	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _cap_arrays(caps))
-	mesh.surface_set_material(0, mat_cap)
-	_cap_mi.mesh = mesh
+	_cap_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _cap_arrays())
+	_cap_mesh.surface_set_material(0, mat_cap)
 
 
 ## The cross-section of a half-space is one flat plane, so that is all this
 ## builds: a single slice of faces, one per solid cell on the last slice that is
-## still drawn, all facing the lens.
+## still drawn, every one of them turned toward the lens.
+##
+## That orientation is the whole point of the mode. Standing on the plane you
+## are looking straight at the faces this emits — they are the wall of the
+## Terraria-style side-on view, and if they are missing you are staring through
+## the terrain shell into nothing. The face wanted is the one on the block's
+## *camera-facing* side, `toward_camera`, because that is the side the removed
+## neighbour used to be against.
 ##
 ## Nothing else can be exposed. Everything past the plane is gone and everything
 ## behind it is untouched, so the only newly bare surfaces in the entire world
@@ -1669,49 +1752,81 @@ func _rebuild_caps() -> void:
 ## cells to test; this walks one slice, reads it a whole column at a time out of
 ## the solid bitmask, and merges vertical runs of the same block into single
 ## quads — which underground collapses a 48-block column into one or two.
-func _caps_from_plane(caps: Array) -> void:
+func _caps_from_plane() -> void:
 	var cut := cutaway
 	var cam := cut.camera_position
 	var axis := cut.plane_axis()
 	var plane := cut.plane_coord()
-	var dir := dir_index(-cut.toward_camera())
-	var centre := cut.plane_across()
+	var toward := cut.plane_toward()
+	# the block's own face on the side the lens is, which is the side the cut
+	# just emptied. The opposite face is buried and points away from the camera.
+	var dir := dir_index(cut.toward_camera())
 	var reach := cut.planar_cap_reach
 
-	for offset in range(-reach, reach + 1):
-		var gx := plane if axis == 0 else centre + offset
-		var gz := centre + offset if axis == 0 else plane
-		var mask := solid_mask_at(gx, gz)
-		if mask == 0:
+	# The window is anchored to the player's chunk, not to the player, so that it
+	# matches the signature that decides when this runs at all.
+	var chunk_base := (cut.plane_across() >> 4) << 4
+	var lo := chunk_base - reach
+	var hi := chunk_base + CW - 1 + reach
+
+	# The columns of a slice run consecutively across one axis, so they fall into
+	# a handful of chunks rather than a hundred separate ones. Resolving the
+	# chunk per chunk instead of per column is what this loop is shaped around:
+	# `solid_mask_at` and `get_block` each hash a Vector2i every time they are
+	# called, and at forty-eight cells a column that hashing was the rebuild.
+	var plane_c := plane >> 4
+	var far_c := (plane + toward) >> 4
+	var plane_l := plane & 15
+	var far_l := (plane + toward) & 15
+
+	var across := lo
+	while across <= hi:
+		var ac := across >> 4
+		# how far this chunk carries, so the two lookups amortise over 16 columns
+		var run_end := mini(hi, (ac << 4) + CW - 1)
+		var near: Chunk = _chunks.get(
+			Vector2i(plane_c, ac) if axis == 0 else Vector2i(ac, plane_c))
+		if near == null:
+			across = run_end + 1
 			continue
-		# Fetch the column once. `get_block` re-resolves the chunk on every
-		# call, and at forty-eight cells a column across a hundred columns that
-		# lookup is the whole cost of the rebuild.
-		var c: Chunk = _chunks.get(Vector2i(gx >> 4, gz >> 4))
-		if c == null:
-			continue
-		var base := ((gx & 15) * CW + (gz & 15)) * WH
-		var y := 0
-		while y < WH:
-			if (mask >> y) & 1 == 0:
-				y += 1
+		var far: Chunk = _chunks.get(
+			Vector2i(far_c, ac) if axis == 0 else Vector2i(ac, far_c))
+		while across <= run_end:
+			var al := across & 15
+			var ci := (plane_l * CW + al) if axis == 0 else (al * CW + plane_l)
+			# Only cells whose removed neighbour was itself opaque need a cap: if
+			# it was air or glass the chunk mesher already drew this face, and a
+			# second coplanar copy is z-fighting, not a cross-section.
+			var fi := (far_l * CW + al) if axis == 0 else (al * CW + far_l)
+			var mask: int = near.solid[ci] & (0 if far == null else far.solid[fi])
+			if mask == 0:
+				across += 1
 				continue
-			# how far the run of the *same* block carries upward
-			var id: int = c.types[base + y]
-			var top := y + 1
-			while top < WH and (mask >> top) & 1 != 0 \
-					and c.types[base + top] == id:
-				top += 1
-			if Blocks.is_opaque(id):
+			var gx := plane if axis == 0 else across
+			var gz := across if axis == 0 else plane
+			var base := ci * WH
+			var types := near.types
+			var y := 0
+			while y < WH:
+				if (mask >> y) & 1 == 0:
+					y += 1
+					continue
+				# how far the run of the *same* block carries upward
+				var id: int = types[base + y]
+				var top := y + 1
+				while top < WH and (mask >> top) & 1 != 0 \
+						and types[base + top] == id:
+					top += 1
 				var ao := clampf(1.0 - Vector3(gx, y, gz).distance_to(cam) * 0.02,
 					0.62, 1.0)
-				caps.append(Vector3i(gx, y, gz))
-				caps.append(dir | (int(ao * 255.0) << 8) | (id << 16)
+				_cap_cells.append(Vector3(gx, y, gz))
+				_cap_meta.append(dir | (int(ao * 255.0) << 8) | (id << 16)
 					| ((top - y) << 24))
-			y = top
+				y = top
+			across += 1
 
 
-func _caps_from_bounds(caps: Array) -> void:
+func _caps_from_bounds() -> void:
 	var cut := cutaway
 	var bounds := cut.get_int_bounds()
 	var cam := cut.camera_position
@@ -1733,58 +1848,60 @@ func _caps_from_bounds(caps: Array) -> void:
 					continue
 				if not cut.is_cut(x, y, z):
 					continue
-				_cap_neighbours(caps, x, y, z, cam)
+				_cap_neighbours(x, y, z, cam)
 
 
 ## The fill already produced its cut set as a list, so walking that is strictly
 ## cheaper than rescanning the box that contains it.
-func _caps_from_cells(caps: Array) -> void:
+func _caps_from_cells() -> void:
 	var cut := cutaway
 	var cam := cut.camera_position
 	for i in cut.fill_cells.size():
 		var c: Vector3i = _unpack(cut.fill_cells[i])
 		if cut.is_protected(Vector3(c) + Vector3(0.5, 0.5, 0.5)):
 			continue
-		_cap_neighbours(caps, c.x, c.y, c.z, cam)
+		_cap_neighbours(c.x, c.y, c.z, cam)
 
 
-## Emit the faces the discard just exposed around one cut cell.
-func _cap_neighbours(caps: Array, x: int, y: int, z: int, cam: Vector3) -> void:
+## Emit the faces the discard just exposed around one cut cell. Each face named
+## here belongs to the *surviving* neighbour and points back at the cell that
+## was removed, which is the same convention `_caps_from_plane` follows.
+func _cap_neighbours(x: int, y: int, z: int, cam: Vector3) -> void:
 	var cut := cutaway
 	var dist_to_cam := Vector3(x, y, z).distance_to(cam)
 
 	var b_up := get_block(x, y + 1, z)
 	if b_up != Blocks.AIR and Blocks.is_opaque(b_up) and not cut.is_cut(x, y + 1, z):
-		_cap_face(caps, Vector3i(x, y + 1, z), 3, dist_to_cam)  # -Y of the block above
+		_cap_face(Vector3i(x, y + 1, z), 3, dist_to_cam)  # -Y of the block above
 	var b_dn := get_block(x, y - 1, z)
 	if b_dn != Blocks.AIR and Blocks.is_opaque(b_dn) and not cut.is_cut(x, y - 1, z):
-		_cap_face(caps, Vector3i(x, y - 1, z), 2, dist_to_cam)
+		_cap_face(Vector3i(x, y - 1, z), 2, dist_to_cam)
 	var b_px := get_block(x + 1, y, z)
 	if b_px != Blocks.AIR and Blocks.is_opaque(b_px) and not cut.is_cut(x + 1, y, z):
-		_cap_face(caps, Vector3i(x + 1, y, z), 1, dist_to_cam)
+		_cap_face(Vector3i(x + 1, y, z), 1, dist_to_cam)
 	var b_nx := get_block(x - 1, y, z)
 	if b_nx != Blocks.AIR and Blocks.is_opaque(b_nx) and not cut.is_cut(x - 1, y, z):
-		_cap_face(caps, Vector3i(x - 1, y, z), 0, dist_to_cam)
+		_cap_face(Vector3i(x - 1, y, z), 0, dist_to_cam)
 	var b_pz := get_block(x, y, z + 1)
 	if b_pz != Blocks.AIR and Blocks.is_opaque(b_pz) and not cut.is_cut(x, y, z + 1):
-		_cap_face(caps, Vector3i(x, y, z + 1), 5, dist_to_cam)
+		_cap_face(Vector3i(x, y, z + 1), 5, dist_to_cam)
 	var b_nz := get_block(x, y, z - 1)
 	if b_nz != Blocks.AIR and Blocks.is_opaque(b_nz) and not cut.is_cut(x, y, z - 1):
-		_cap_face(caps, Vector3i(x, y, z - 1), 4, dist_to_cam)
+		_cap_face(Vector3i(x, y, z - 1), 4, dist_to_cam)
 
 
-func _cap_face(caps: Array, cell: Vector3i, dir: int, dist: float) -> void:
+func _cap_face(cell: Vector3i, dir: int, dist: float) -> void:
 	var id := get_block(cell.x, cell.y, cell.z)
 	if id == Blocks.AIR:
 		return
 	# darken with distance so a deep slice reads as depth, not as a flat wall
 	var ao := clampf(1.0 - dist * 0.02, 0.62, 1.0)
-	caps.append(cell)
-	caps.append(dir | (int(ao * 255.0) << 8) | (id << 16) | (1 << 24))
+	_cap_cells.append(Vector3(cell))
+	_cap_meta.append(dir | (int(ao * 255.0) << 8) | (id << 16) | (1 << 24))
 
 
-func _cap_arrays(caps: Array) -> Array:
-	var n := caps.size() / 2
+func _cap_arrays() -> Array:
+	var n := _cap_meta.size()
 	var verts := PackedVector3Array()
 	var norms := PackedVector3Array()
 	var uvs := PackedVector2Array()
@@ -1804,14 +1921,13 @@ func _cap_arrays(caps: Array) -> Array:
 	var vi := 0
 	var ii := 0
 	for k in n:
-		var cell: Vector3i = caps[k * 2]
-		var packed: int = caps[k * 2 + 1]
+		var origin := _cap_cells[k]
+		var packed: int = _cap_meta[k]
 		var dir := packed & 255
 		var ao := float((packed >> 8) & 255) / 255.0
 		var id := (packed >> 16) & 255
 		var run := maxi((packed >> 24) & 255, 1)
 		var tile := Blocks.tile_of(id, dir)
-		var origin := Vector3(cell)
 		var nrm: Vector3 = FACE_NORMAL[dir]
 		var vt: Array = FACE_VERTS[dir]
 		var u0 := float(tile % TexGen.ATLAS_COLS) * tw + eps

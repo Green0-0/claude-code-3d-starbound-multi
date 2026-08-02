@@ -74,8 +74,15 @@ var keep_bias := 0.35
 ## begins at the first cell between you and the lens.
 var planar_offset := 1
 ## How wide a window of the plane the cross-section is built for, either side of
-## the player. Only the cap cares; the predicate itself is unbounded.
-var planar_cap_reach := 56
+## the *chunk* the player is in. Only the cap cares; the predicate itself is
+## unbounded.
+##
+## Measured from the chunk rather than from the player on purpose. The signature
+## only notices the player crossing a chunk boundary, so a window centred on the
+## exact anchor would quietly shrink to `reach - 15` on one side as they walked
+## across that chunk. Anchored to the chunk, the window the mesh was built for
+## and the window the signature promises are the same window.
+var planar_cap_reach := 48
 
 # ----------------------------------------------------------------------- fill
 ##
@@ -288,6 +295,45 @@ func plane_across() -> int:
 	return anchor.z if plane_axis() == 0 else anchor.x
 
 
+## Which chunks are wholly past the plane, as one comparable value.
+##
+## A chunk that is wholly cut has nothing left to draw, so it can be hidden
+## outright instead of being submitted for the fragment shader to discard a
+## column at a time. In planar mode that is roughly half the loaded world, and
+## it is the one saving that scales with view distance rather than with the size
+## of the cross-section.
+##
+## It reduces to a single threshold — `x` names the axis, `y` the side, `z` the
+## first chunk coordinate that is wholly gone — because the boundary is a plane
+## and chunks are a regular grid. That matters: the sweep over every loaded
+## chunk is not free, and while this value holds no chunk can have changed side,
+## so walking fifteen of every sixteen blocks skips it entirely.
+##
+## Zero means nothing is hidden. Ghosts are why that case is not just "planar
+## and occluded": when cut blocks are drawn faded rather than deleted they are
+## still on screen, so nothing may be hidden.
+func planar_cull_key() -> Vector3i:
+	if not enabled or mode != Mode.PLANAR or not occluded or opacity > 0.0:
+		return Vector3i.ZERO
+	var axis := plane_axis()
+	var t := plane_toward()
+	var a := anchor.x if axis == 0 else anchor.z
+	# The near corner of the chunk decides it, so the threshold is the first
+	# chunk coordinate whose whole 16-block span clears the plane.
+	var edge := (a + planar_offset + 15) >> 4 if t > 0 \
+		else (a - planar_offset - 15) >> 4
+	return Vector3i(axis + 1, t, edge)
+
+
+## Is every block of this chunk past the plane?
+func planar_chunk_hidden(cx: int, cz: int) -> bool:
+	var key := planar_cull_key()
+	if key.x == 0:
+		return false
+	var c := cx if key.x == 1 else cz
+	return c >= key.z if key.y > 0 else c <= key.z
+
+
 # =============================================================================
 # presentation
 # =============================================================================
@@ -311,8 +357,14 @@ func mode_name() -> String:
 # bookkeeping
 # =============================================================================
 
-## Everything the cut set depends on, in one comparable value. While this has
+## Everything the cut set depends on, as three integer vectors. While these have
 ## not changed, neither has the cross-section, and the cached mesh stands.
+##
+## They are `Vector4i` rather than a formatted string because this is the one
+## part of the system that runs on *every* frame no matter what the player does.
+## A string signature meant the idle path still cost a heap allocation and a
+## format parse per frame; three vector compares cost nothing and allocate
+## nothing, which is what "standing still is free" was supposed to mean.
 ##
 ## Each mode gets only the terms it actually depends on, and that is the whole
 ## performance story of this system:
@@ -320,23 +372,39 @@ func mode_name() -> String:
 ##   PLANAR depends on one integer — which plane. Walking across the plane or up
 ##     and down it changes nothing, so the great majority of ordinary movement
 ##     costs nothing at all. Only the cap *window* follows the player, and it is
-##     quantised to a chunk so it moves once every sixteen blocks.
+##     quantised to a chunk so it moves once every sixteen blocks. Height is not
+##     a term at all: the cross-section is built for the full column, so walking
+##     up and down a shaft cannot invalidate it.
 ##   FILL depends on which room you are in, not where you stand in it, so the
 ##     flood is quantised to four blocks. The lens cell drops out entirely: the
 ##     mask is built along the facing axis and the facing is already a term.
 ##   CYLINDER genuinely is a line from the lens to the player, so it needs both.
-func signature(world_version: int) -> String:
-	var head := "%d|%d|%d|%d|%d|%d" % [mode, facing, int(occluded), int(enabled),
-		int(opacity > 0.0), world_version]
+func sig_head(world_version: int) -> Vector4i:
+	var flags := (1 if enabled else 0) | (2 if occluded else 0) \
+		| (4 if opacity > 0.0 else 0)
+	return Vector4i(mode, facing, flags, world_version)
+
+
+func sig_lo() -> Vector4i:
 	match mode:
 		Mode.PLANAR:
-			return "%s|P%d|%d,%d" % [head, plane_coord(),
-				plane_across() >> 4, anchor.y >> 4]
+			return Vector4i(plane_coord(), plane_across() >> 4, 0, 0)
 		Mode.FILL:
-			return "%s|F%d,%d,%d|%.3f" % [head, anchor.x >> 2, anchor.y >> 2,
-				anchor.z >> 2, view_slope()]
-	return "%s|C%d,%d,%d|%d,%d,%d" % [head, anchor.x, anchor.y, anchor.z,
-		cam_cell.x, cam_cell.y, cam_cell.z]
+			return Vector4i(anchor.x >> 2, anchor.y >> 2, anchor.z >> 2,
+				roundi(view_slope() * 8.0))
+	return Vector4i(anchor.x, anchor.y, anchor.z, 0)
+
+
+func sig_hi() -> Vector4i:
+	if mode == Mode.CYLINDER:
+		return Vector4i(cam_cell.x, cam_cell.y, cam_cell.z, 0)
+	return Vector4i.ZERO
+
+
+## The same thing rendered for eyes and for tests. Nothing on the frame path
+## calls this — `sig_head`/`sig_lo`/`sig_hi` are compared directly.
+func signature(world_version: int) -> String:
+	return "%s|%s|%s" % [sig_head(world_version), sig_lo(), sig_hi()]
 
 
 func get_int_bounds() -> AABB:

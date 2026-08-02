@@ -68,14 +68,8 @@ func _walk(mode: int, step: Vector3, label: String) -> void:
 		world.update_cutaway(game.rig.camera.global_position,
 			player.global_position)
 		var t0 := Time.get_ticks_usec()
-		# force the same work _process would do, and time only that
-		var sig: String = world.cutaway.signature(world._world_version)
-		if sig != world._cut_sig:
-			world._cut_sig = sig
-			world.cut_rebuilds += 1
-			if mode == Cutaway.Mode.FILL:
-				world._rebuild_fill()
-			world._rebuild_caps()
+		# exactly the work _process would do, and time only that
+		world.refresh_cutaway()
 		var ms := float(Time.get_ticks_usec() - t0) / 1000.0
 		total += ms
 		worst = maxf(worst, ms)

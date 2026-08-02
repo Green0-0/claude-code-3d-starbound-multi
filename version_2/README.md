@@ -50,7 +50,7 @@ lens is still removed.
 |---|---|
 | **Drill** | a cylinder from the lens to the player, with a spherical cap at your end so you stay visible pressed against a wall |
 | **Fill** | cast to the first air along the sightline, flood-fill the pocket you are standing in, and cut everything between *that whole pocket* and the lens |
-| **Planar** | when you are genuinely occluded, a slab of voxel coordinates directly in front of you: the flat side-on cross-section |
+| **Planar** | when you are genuinely occluded, everything past one coordinate plane a block in front of you — a half-space, with no lateral, vertical or far bound at all |
 
 Drill handles the awkward cases for free — fall down a hole and it punches
 straight through the roof, exposing the shaft without gouging the hillside.
@@ -61,8 +61,14 @@ only travels through **covered** air, which is what confines it: a doorway does
 not leak it into the open sky, so it works indoors as well as underground, and
 standing in a field it does nothing at all.
 
-Planar is the classic Starbound slab, and it stays dormant until something is
-actually in the way.
+Planar is the classic Starbound side-on view, and it stays dormant until
+something is actually in the way. The plane you are standing on is drawn as a
+**wall**: every buried block on it hands back the face its removed neighbour was
+hiding, turned toward the lens, so you are looking at a flat Terraria-style
+cross-section rather than through the terrain shell. It is also the cheapest
+mode by a wide margin — the cut set is one integer, so walking across the plane
+or up and down it costs nothing at all, and the chunks wholly past the plane are
+not submitted for drawing in the first place.
 
 ### Ghosts instead of holes
 

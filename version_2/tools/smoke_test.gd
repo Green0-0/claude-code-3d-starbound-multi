@@ -870,10 +870,21 @@ func _cutaway_modes() -> void:
 	check("walking across the plane rebuilds at most once per chunk",
 		moved_sig <= 1, "%d of 8 sideways steps invalidated" % moved_sig)
 
+	# Height is not a term at all. The slice is built for the whole column, so
+	# climbing a shaft cannot invalidate a cross-section that already covers it.
+	cut.place(cam, target)
+	var sig_ground := cut.signature(0)
+	cut.place(cam + Vector3(0, 11, 0), target + Vector3(0, 11, 0))
+	check("climbing never rebuilds the cross-section",
+		cut.signature(0) == sig_ground)
+
 	cut.place(cam, target)
 	cut.place(cam + Vector3(0, 0, -2), target + Vector3(0, 0, -2))
 	check("stepping along the view axis does move the plane",
 		cut.plane_coord() != plane_here)
+
+	_planar_faces(cam, target)
+
 	world.update_cutaway(cam, target)
 	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
 
@@ -912,6 +923,37 @@ func _cutaway_modes() -> void:
 	check("breaking a block rebuilds the cross-section immediately",
 		world.cut_rebuilds > before_break)
 
+	# --- but the writes that change constantly and change nothing must not.
+	#
+	# Liquid flow and crop growth write blocks on their own timers, for as long
+	# as the world exists. Nothing they write is opaque and nothing they write
+	# collides, so none of it can move a vertex of any cross-section — but the
+	# version the cut watches was bumped by every write alike, so standing near
+	# running water rebuilt the whole slice several times a second, forever.
+	var wet := Vector3i(feet2.x + 3, feet2.y + 1, feet2.z)
+	world.set_cutaway_mode(Cutaway.Mode.PLANAR)
+	world.cutaway.occluded = true
+	await _settle(4)
+	var before_water: int = world.cut_rebuilds
+	# a frame apart, the way the flow timer actually writes them — batched into
+	# one frame the signature is only compared once and the cost is hidden
+	for i in 8:
+		world.set_block(wet.x, wet.y, wet.z,
+			Blocks.id(&"water") if i % 2 == 0 else Blocks.AIR)
+		await _settle(2)
+	check("flowing water never rebuilds the cross-section",
+		world.cut_rebuilds == before_water,
+		"%d rebuilds over 8 writes" % (world.cut_rebuilds - before_water))
+
+	var before_stone: int = world.cut_rebuilds
+	world.set_block(wet.x, wet.y, wet.z, Blocks.STONE)
+	await _settle(3)
+	check("...but a block that is really there still does",
+		world.cut_rebuilds > before_stone)
+	world.set_block(wet.x, wet.y, wet.z, Blocks.AIR)
+	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+	await _settle(2)
+
 	# --- and the block itself stops being drawn on the very next frame.
 	#
 	# This is the ghost. The chunk remesh used to sit in the same time-budgeted
@@ -930,6 +972,131 @@ func _cutaway_modes() -> void:
 			standing > 0 and _own_faces_at(cell) == 0,
 			"%d faces before, %d after one frame" % [standing, _own_faces_at(cell)])
 	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+
+
+## The faces on the split itself.
+##
+## This is the mode's whole reason to exist. Standing on the plane you are
+## looking straight at the slice, so every solid cell on it whose forward
+## neighbour the cut removed has to hand back the face that neighbour was
+## hiding — on the lens side of the block, pointing at the lens. Emitted on the
+## far side, or with the opposite normal, every quad is backface-culled and
+## buried, and the mode reads as a hole into the skybox rather than as a wall.
+##
+## Nothing checked that before, which is exactly how it came to be wrong.
+func _planar_faces(cam: Vector3, target: Vector3) -> void:
+	var cut := world.cutaway
+	var feet := player.feet_block()
+
+	# a solid slab below the player, with a pocket in it to look out of
+	var cy: int = maxi(feet.y - 8, 3)
+	for dx in range(-6, 7):
+		for dz in range(-6, 7):
+			for dy in range(-2, 5):
+				world.set_block(feet.x + dx, cy + dy, feet.z + dz, Blocks.STONE)
+	world.set_block(feet.x, cy, feet.z, Blocks.AIR)
+	world.set_block(feet.x, cy + 1, feet.z, Blocks.AIR)
+
+	var buried := Vector3(feet.x + 0.5, float(cy), feet.z + 0.5)
+	world.set_cutaway_mode(Cutaway.Mode.PLANAR)
+	world.update_cutaway(buried + Vector3(0, 15, -22), buried)
+	cut.occluded = true
+	world._rebuild_caps()
+
+	var axis := cut.plane_axis()
+	var plane := cut.plane_coord()
+	var t := cut.plane_toward()
+	var toward := Vector3(cut.toward_camera())
+	# the cut side of the block: +1 when the lens is at increasing coordinates
+	var face_at := float(plane) + (1.0 if t > 0 else 0.0)
+
+	var mesh: ArrayMesh = world._cap_mi.mesh
+	check("the split has a cross-section at all",
+		mesh != null and mesh.get_surface_count() > 0)
+	if mesh == null or mesh.get_surface_count() == 0:
+		return
+	var arrays: Array = mesh.surface_get_arrays(0)
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var norms: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL]
+
+	var wrong_way := 0
+	for n: Vector3 in norms:
+		if n.dot(toward) < 0.99:
+			wrong_way += 1
+	check("every face on the split turns toward the lens", wrong_way == 0,
+		"%d of %d point away" % [wrong_way, norms.size()])
+
+	var off_plane := 0
+	for v: Vector3 in verts:
+		if absf((v.x if axis == 0 else v.z) - face_at) > 0.001:
+			off_plane += 1
+	check("every face on the split stands on the split", off_plane == 0,
+		"%d of %d vertices are off it" % [off_plane, verts.size()])
+
+	# Coverage: the merged runs have to account for every buried cell of the
+	# slice, not just the ones nearest the player.
+	var covered := {}
+	for i in world._cap_meta.size():
+		var o: Vector3 = world._cap_cells[i]
+		var run: int = maxi((world._cap_meta[i] >> 24) & 255, 1)
+		for r in run:
+			covered[Vector3i(int(o.x), int(o.y) + r, int(o.z))] = true
+
+	var want := 0
+	var got := 0
+	for da in range(-5, 6):
+		for y in range(cy - 2, cy + 5):
+			var gx: int = plane if axis == 0 else feet.x + da
+			var gz: int = feet.z + da if axis == 0 else plane
+			var fx: int = gx + (t if axis == 0 else 0)
+			var fz: int = gz + (0 if axis == 0 else t)
+			if not Blocks.is_opaque(world.get_block(gx, y, gz)):
+				continue
+			if not Blocks.is_opaque(world.get_block(fx, y, fz)):
+				continue
+			want += 1
+			if covered.has(Vector3i(gx, y, gz)):
+				got += 1
+	check("every buried cell on the split gets its face back",
+		want > 0 and got == want, "%d of %d covered" % [got, want])
+
+	# ...and only those. A cell whose forward neighbour was already air kept the
+	# face the chunk mesher gave it, and a second coplanar copy is z-fighting.
+	var doubled := 0
+	for c: Vector3i in covered:
+		var fx: int = c.x + (t if axis == 0 else 0)
+		var fz: int = c.z + (0 if axis == 0 else t)
+		if not Blocks.is_opaque(world.get_block(fx, c.y, fz)):
+			doubled += 1
+	check("the split never doubles a face the terrain already draws",
+		doubled == 0, "%d of %d duplicated" % [doubled, covered.size()])
+
+	# --- and the chunks with nothing left in them are not submitted at all
+	var here := Vector2i(feet.x >> 4, feet.z >> 4)
+	var past := here
+	if axis == 0:
+		past.x += t * 4
+	else:
+		past.y += t * 4
+	check("planar hides the chunks wholly past the plane",
+		cut.planar_chunk_hidden(past.x, past.y), str(past))
+	check("planar keeps the chunk you are standing in",
+		not cut.planar_chunk_hidden(here.x, here.y))
+	var behind := here
+	if axis == 0:
+		behind.x -= t * 4
+	else:
+		behind.y -= t * 4
+	check("planar keeps everything behind the plane",
+		not cut.planar_chunk_hidden(behind.x, behind.y))
+	# Ghosts are still on screen, so nothing may be hidden while they are drawn.
+	world.set_cutaway_opacity(0.5)
+	check("ghosted blocks are never hidden by the chunk cull",
+		not cut.planar_chunk_hidden(past.x, past.y))
+	world.set_cutaway_opacity(0.0)
+
+	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+	world.update_cutaway(cam, target)
 
 
 ## How many of a cell's *own* outward faces the chunk mesh is still drawing.
