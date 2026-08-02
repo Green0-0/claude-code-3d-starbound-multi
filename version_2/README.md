@@ -103,9 +103,12 @@ So the cut is done twice:
   strata, a faint survey grid, and a warm glow falling off with distance from
   the player. That glow is what "highlights the tunnel" you just walked into.
 
-The caps are rebuilt only when the player or the camera moves, and the scan is
-restricted to the bounding box of the cut volume, so it costs a few thousand
-cell tests rather than a re-mesh.
+The caps are rebuilt only when something the cut actually depends on changes,
+and each mode is walked by its own shape rather than by the box around it: the
+drill marches its segment, the fill walks the cells its flood already found, and
+the plane reads one slice a column at a time out of the solid bitmask. Walking
+the box instead was measurably the largest recurring cost in the frame — eight
+thousand cell tests to find the three hundred that were cut.
 
 ### Things that are only playable because of it
 
@@ -240,8 +243,11 @@ shaders/
   post.gdshader           vignette, chromatic aberration, split-tone, grain
 tools/
   audit.gd                registry sizes against their hard limits
-  smoke_test.tscn         76 integration assertions
+  smoke_test.tscn         223 integration assertions
+  soak.tscn               the long session: frame-time tail and leak hunt
   playthrough.tscn        a scripted session through every system and panel
+  cut_bench.tscn          what each cut mode costs while the player moves
+  cut_shots.tscn          the three cut modes, photographed underground
   dev_capture.gd          screenshot harness for the cutaway situations
 ```
 
@@ -298,7 +304,8 @@ throws it away has broken the game.
 ```
 godot --headless --import --path .                 # compile everything
 godot --headless --path . --script tools/audit.gd  # registry sizes vs limits
-godot --headless --path . tools/smoke_test.tscn    # 76 integration assertions
+godot --headless --path . tools/smoke_test.tscn    # 223 integration assertions
+godot --headless --path . tools/soak.tscn          # long session: spikes + leaks
 godot --path .              tools/playthrough.tscn # scripted play + screenshots
 ```
 
@@ -314,6 +321,28 @@ shell protects the floor and the trunk beside you but not the block in the way,
 the fill never escapes into the open sky, planar stays dormant in the open,
 crouching genuinely changes the swept box, and a shelled creature soaks damage
 until its shell is gone.
+
+`tools/soak.tscn` is the one that answers *"is it still smooth an hour in"*, and
+it is a different question from everything above. It walks the player at running
+pace along two bearings, alternating, so that every other lap covers identical
+ground and chunks unload and regenerate over the same villages and mineshafts.
+It digs, floods a cavern, mines a gallery a block a frame, and cycles all three
+cut modes. Two things come out:
+
+* **The frame-time tail.** Not the average — an average hides exactly what
+  players report. It keeps every frame and prints p95, p99, the worst, and how
+  many frames missed a 30 Hz and a 20 Hz deadline. Alongside it, `scripts/prof.gd`
+  attributes each frame to the subsystem that spent it and counts how many frames
+  each was *alone* responsible for stalling, which is the number that survives a
+  noisy machine when a single worst-case sample does not.
+* **Every counter that could grow without bound**, sampled once a lap and printed
+  as a column: nodes, resident chunks, deferred structure writes, queued
+  structure specs, villagers, placed objects, liquid cells, memory. A leak is a
+  column that climbs. Populations the game unloads are held to a ceiling; world
+  content the game *keeps* is allowed to accumulate as new ground is explored but
+  has to stop accumulating once the ground stops being new.
+
+Run it with `SOAK_LAPS=8` (or more) before believing a performance change.
 
 `tools/playthrough.tscn` needs a real renderer for the screenshots but runs
 headless for the logic. It exists mainly for the **panels**: they are only built

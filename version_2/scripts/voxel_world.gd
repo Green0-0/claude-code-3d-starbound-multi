@@ -22,6 +22,8 @@ const SEA := 12
 const FILL_EXTENT := Vector3i(52, 48, 52)
 const MAX_FILL_CELLS := 3000
 const MAX_MARKED_CELLS := 26000
+## How many chunks the unbudgeted player-edit remesh may rebuild in one frame.
+const MAX_URGENT_MESH := 3
 
 @export var view_radius := 5
 @export var gen_budget_us := 6000
@@ -45,8 +47,42 @@ const FACE_VERTS := [
 ]
 const FACE_UV := [Vector2(0, 1), Vector2(1, 1), Vector2(1, 0), Vector2(0, 0)]
 const AO_LUT := [0.44, 0.66, 0.85, 1.0]
+
+## The same three tables again, flat and typed, for the mesher's inner loop.
+##
+## `FACE_VERTS[dir][j]` is two Variant unboxes per vertex and there are four
+## vertices on every face of every chunk in the world; `FLAT_VERTS[dir * 4 + j]`
+## is one typed read. Meshing is the largest single cost in the frame and this
+## loop is all of it, so the duplication earns its keep. The originals stay
+## because they read better everywhere that is not this loop.
+##
+## `static var` rather than `const` only because GDScript will not accept a
+## packed array as a constant expression. Nothing writes to them.
+static var FLAT_VERTS := PackedVector3Array([
+	Vector3(1, 0, 1), Vector3(1, 0, 0), Vector3(1, 1, 0), Vector3(1, 1, 1),
+	Vector3(0, 0, 0), Vector3(0, 0, 1), Vector3(0, 1, 1), Vector3(0, 1, 0),
+	Vector3(0, 1, 1), Vector3(1, 1, 1), Vector3(1, 1, 0), Vector3(0, 1, 0),
+	Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(1, 0, 1), Vector3(0, 0, 1),
+	Vector3(0, 0, 1), Vector3(1, 0, 1), Vector3(1, 1, 1), Vector3(0, 1, 1),
+	Vector3(1, 0, 0), Vector3(0, 0, 0), Vector3(0, 1, 0), Vector3(1, 1, 0),
+])
+static var FLAT_NORMAL := PackedVector3Array([
+	Vector3(1, 0, 0), Vector3(-1, 0, 0),
+	Vector3(0, 1, 0), Vector3(0, -1, 0),
+	Vector3(0, 0, 1), Vector3(0, 0, -1),
+])
+static var FLAT_UV := PackedVector2Array([
+	Vector2(0, 1), Vector2(1, 1), Vector2(1, 0), Vector2(0, 0),
+])
+static var FLAT_AO := PackedFloat32Array([0.44, 0.66, 0.85, 1.0])
 ## face ids for the four horizontal directions handled by the shared side loop
 const SIDE_FACE := [0, 1, 4, 5]
+## The six axis steps. A constant because every place that wants them wants them
+## inside a loop, and an array literal in a loop body is rebuilt every pass.
+const NEIGHBOURS := [
+	Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0),
+	Vector3i(0, -1, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1),
+]
 
 # ------------------------------------------------------------------ chunk data
 class Chunk:
@@ -72,6 +108,11 @@ class Chunk:
 var _chunks := {}                       ## Vector2i -> Chunk
 var _pending := {}                      ## Vector2i -> Array[Vector4i] deferred structure blocks
 var _gen_queue: Array[Vector2i] = []
+## The chunk currently being filled, and how far through it we are. Held out of
+## `_chunks` until complete; see `_begin_chunk`.
+var _building: Chunk = null
+var _build_key := Vector2i.ZERO
+var _build_col := 0
 var _mesh_queue: Array[Vector2i] = []
 var _center := Vector2i(9999, 9999)
 var _initial_done := false
@@ -91,6 +132,11 @@ var _cap_mesh := ArrayMesh.new()
 ## reused so a rebuild does not box a few thousand Variants on the way to a mesh.
 var _cap_cells := PackedVector3Array()
 var _cap_meta := PackedInt32Array()
+## One byte per cell of the cylinder's bounding box, so the drill march can tell
+## whether it has already offered a cell without hashing it.
+var _cap_seen := PackedByteArray()
+## The same trick for the fill mode's flood; see `_rebuild_fill`.
+var _flood_seen := PackedByteArray()
 
 ## Chunks a player edit touched, remeshed next frame ahead of streaming work.
 var _edit_dirty: Array[Vector2i] = []
@@ -251,7 +297,8 @@ func column_top(gx: int, gz: int) -> int:
 	return top
 
 
-func set_block(gx: int, gy: int, gz: int, id: int, mark_dirty := true) -> bool:
+func set_block(gx: int, gy: int, gz: int, id: int, mark_dirty := true,
+		urgent := false) -> bool:
 	if gy < 0 or gy >= WH:
 		return false
 	var key := Vector2i(gx >> 4, gz >> 4)
@@ -295,29 +342,46 @@ func set_block(gx: int, gy: int, gz: int, id: int, mark_dirty := true) -> bool:
 			or Blocks.is_solid(was) != Blocks.is_solid(id):
 		_world_version += 1
 	if mark_dirty:
-		_touch(key)
+		_touch(key, urgent)
 		if lx == 0:
-			_touch(key + Vector2i(-1, 0))
+			_touch(key + Vector2i(-1, 0), urgent)
 		elif lx == CW - 1:
-			_touch(key + Vector2i(1, 0))
+			_touch(key + Vector2i(1, 0), urgent)
 		if lz == 0:
-			_touch(key + Vector2i(0, -1))
+			_touch(key + Vector2i(0, -1), urgent)
 		elif lz == CW - 1:
-			_touch(key + Vector2i(0, 1))
+			_touch(key + Vector2i(0, 1), urgent)
 	return true
 
 
-func _touch(key: Vector2i) -> void:
+## The block the *player* just broke or placed. Identical to `set_block` except
+## that the remesh jumps the streaming queue.
+##
+## Only a write the player is waiting on earns that. See `_touch`.
+func edit_block(gx: int, gy: int, gz: int, id: int) -> bool:
+	return set_block(gx, gy, gz, id, true, true)
+
+
+func _touch(key: Vector2i, urgent := false) -> void:
 	var c: Chunk = _chunks.get(key)
-	if c != null and c.generated and not c.dirty:
+	if c == null or not c.generated:
+		return
+	if not c.dirty:
 		c.dirty = true
 		_mesh_queue.push_front(key)
-	# An edit is not streaming work and must not queue behind it. Remember the
-	# chunk so the next frame remeshes it before anything else and outside the
-	# time budget: a block you just destroyed has to stop being drawn *now*, and
+	# An edit the player is waiting on is not streaming work and must not queue
+	# behind it: a block you just destroyed has to stop being drawn *now*, and
 	# under load — which in cut modes means most of the time — a budgeted queue
 	# can leave it standing for many frames. That is the ghost.
-	if c != null and c.generated and not _edit_dirty.has(key):
+	#
+	# But only the player's own edits. `set_block` is how the *whole simulation*
+	# writes: water flows, sand falls, wheat grows, structures decorate. Those
+	# all took the unbudgeted path too, so a chunk with a stream in it remeshed
+	# outside the frame budget several times a second, forever — which measured
+	# as the single largest source of stutter in the game. They belong on the
+	# queue above, which already puts them at the front and still respects the
+	# budget, so they lose nothing but the ability to blow a frame.
+	if urgent and not _edit_dirty.has(key):
 		_edit_dirty.append(key)
 
 
@@ -357,6 +421,36 @@ func _rebuild_queues() -> void:
 				c.mi.queue_free()
 			_chunks.erase(k)
 
+	# The chunk in flight, if the player has already left it behind. Half a
+	# chunk of noise is not worth carrying, and it is regenerated from scratch
+	# if they turn around.
+	if _building != null:
+		var bd: Vector2i = _build_key - _center
+		if absi(bd.x) > cull or absi(bd.y) > cull:
+			_building = null
+
+	# And the blocks a structure wrote into a chunk that never arrived.
+	#
+	# These are held for a chunk that has not generated yet, and are consumed
+	# when it does. A structure that reaches into ground the player then walks
+	# away from is never consumed, so without this the dictionary keeps one
+	# entry per such chunk for the rest of the session — a slow leak that tracks
+	# how much of the world has been explored, which is exactly the shape of
+	# leak a long session finds.
+	#
+	# Dropping them is only safe because the chunk that *wrote* them will be
+	# regenerated too, and will write them again. That is what the extra margin
+	# buys: a structure spans at most a few chunks, so anything still holding
+	# writes for a chunk this far out has certainly been culled itself, and
+	# cannot come back without re-running its own decoration. Pruning at the
+	# plain cull distance left a window where the writer was still resident, and
+	# the structure would have come back one wall short.
+	var pending_cull := cull + 4
+	for k in _pending.keys():
+		var d: Vector2i = k - _center
+		if absi(d.x) > pending_cull or absi(d.y) > pending_cull:
+			_pending.erase(k)
+
 	if _initial_total <= 1:
 		_initial_total = maxi(_gen_queue.size(), 1)
 
@@ -367,37 +461,63 @@ func _process(_delta: float) -> void:
 	# cannot run away, and it is what guarantees a broken block stops being
 	# drawn on the very next frame instead of whenever the streaming queue gets
 	# round to it.
+	var p := Prof.mark()
+	# A single block edit touches at most three chunks — its own, and a
+	# neighbour on each axis if it sat on a seam — so the cap is never reached
+	# by a player mining normally. What it bounds is the pathological case: an
+	# area tool, a collapsing structure, a harness digging a shaft a frame. The
+	# overflow is not dropped, only deferred; `_touch` already pushed it to the
+	# front of the mesh queue, so it is the very next thing that runs.
 	if not _edit_dirty.is_empty():
+		var done := 0
 		for key: Vector2i in _edit_dirty:
+			if done >= MAX_URGENT_MESH:
+				break
 			var c: Chunk = _chunks.get(key)
 			if c != null and c.dirty and _neighbours_ready(key):
 				_build_chunk_mesh(c)
+				done += 1
 		_edit_dirty.clear()
+	Prof.add(&"stream.edits", p)
 
 	var budget := load_budget_us if not _initial_done else gen_budget_us
 	var t0 := Time.get_ticks_usec()
 
-	while not _gen_queue.is_empty() and Time.get_ticks_usec() - t0 < budget:
-		var k: Vector2i = _gen_queue.pop_front()
-		if not _chunks.has(k):
-			_generate_chunk(k)
+	p = Prof.mark()
+	var deadline := t0 + budget
+	while Time.get_ticks_usec() < deadline:
+		if _building == null:
+			if _gen_queue.is_empty():
+				break
+			var k: Vector2i = _gen_queue.pop_front()
+			if _chunks.has(k):
+				continue
+			_begin_chunk(k)
+		if not _fill_columns(deadline):
+			break
+		_finish_chunk()
+	Prof.add(&"stream.generate", p)
 
 	budget = load_budget_us if not _initial_done else mesh_budget_us
 	t0 = Time.get_ticks_usec()
+	p = Prof.mark()
 	while Time.get_ticks_usec() - t0 < budget:
 		var nk = _next_meshable()
 		if nk == null:
 			break
 		_build_chunk_mesh(_chunks[nk])
+	Prof.add(&"stream.mesh", p)
 
 	if not _initial_done:
 		var remaining := _gen_queue.size()
 		generation_progress.emit(_initial_total - remaining, _initial_total)
-		if remaining == 0 and _next_meshable() == null:
+		if remaining == 0 and _building == null and _next_meshable() == null:
 			_initial_done = true
 			world_ready.emit()
 
+	p = Prof.mark()
 	refresh_cutaway()
+	Prof.add(&"cutaway.rebuild", p)
 
 
 ## A chunk can only be meshed once its 8 neighbours exist, otherwise we would
@@ -466,6 +586,7 @@ func load_planet(cfg: Dictionary) -> void:
 	_pending.clear()
 	_gen_queue.clear()
 	_mesh_queue.clear()
+	_building = null
 	_center = Vector2i(9999, 9999)
 	_initial_done = false
 	_initial_total = 1
@@ -478,48 +599,79 @@ func load_planet(cfg: Dictionary) -> void:
 	_cull_key = Vector3i.ZERO
 
 
-func _generate_chunk(key: Vector2i) -> void:
-	var ch := Chunk.new(key.x, key.y)
-	_chunks[key] = ch
+## Start a chunk. It is deliberately *not* put in `_chunks` yet.
+##
+## Filling one takes far longer than a frame's whole streaming budget — it is
+## two hundred and fifty six columns of layered noise — so it is filled a few
+## columns at a time across however many frames it needs. Everything else in the
+## game reads the world through `_chunks`, so a half-filled chunk must not be in
+## there: it would read as a column of air, and entities would fall through it.
+## Keeping it aside costs one reference and makes the partial state invisible.
+func _begin_chunk(key: Vector2i) -> void:
+	_building = Chunk.new(key.x, key.y)
+	_build_key = key
+	_build_col = 0
 
-	var ox := key.x * CW
-	var oz := key.y * CW
+
+## Fill columns until the deadline. True when the chunk is complete.
+func _fill_columns(deadline_us: int) -> bool:
+	var ch := _building
+	var ox := _build_key.x * CW
+	var oz := _build_key.y * CW
 	var types := ch.types
 	var solid := ch.solid
 	var any := ch.any
 	var coll := ch.coll
 
-	for lx in CW:
-		var gx := ox + lx
-		for lz in CW:
-			var gz := oz + lz
-			var ci := lx * CW + lz
-			var base := ci * WH
-			gen.fill_column(gx, gz, types, base)
-			# Fold the column into its three bitmasks in one pass: what exists,
-			# what occludes, and what an entity cannot walk through.
-			var m_any := 0
-			var m_solid := 0
-			var m_coll := 0
-			for y in WH:
-				var id := types[base + y]
-				if id == Blocks.AIR:
-					continue
-				var bit := 1 << y
-				m_any |= bit
-				if Blocks.is_opaque(id):
-					m_solid |= bit
-				if Blocks.is_solid(id):
-					m_coll |= bit
-			any[ci] = m_any
-			solid[ci] = m_solid
-			coll[ci] = m_coll
+	# Hoisted: the fold below runs once per voxel, twelve thousand times a chunk,
+	# and `Blocks.is_opaque(id)` is a static call wrapping exactly this read.
+	var t_opaque := Blocks.opaque_table()
+	var t_collide := Blocks.collide_table()
 
-	ch.types = types
-	ch.any = any
-	ch.solid = solid
-	ch.coll = coll
+	while _build_col < COLS:
+		# The clock is read every eighth column rather than every column: a
+		# column is some sixty microseconds, so this overruns the deadline by
+		# half a millisecond at worst, and reading it 256 times a chunk would
+		# itself be measurable.
+		if _build_col & 7 == 0 and Time.get_ticks_usec() >= deadline_us:
+			return false
+		var lx := _build_col >> 4
+		var lz := _build_col & 15
+		_build_col += 1
+		var gx := ox + lx
+		var gz := oz + lz
+		var ci := lx * CW + lz
+		var base := ci * WH
+		gen.fill_column(gx, gz, types, base)
+		# Fold the column into its three bitmasks in one pass: what exists,
+		# what occludes, and what an entity cannot walk through.
+		var m_any := 0
+		var m_solid := 0
+		var m_coll := 0
+		var bit := 1
+		for y in WH:
+			var id := types[base + y]
+			if id != Blocks.AIR:
+				m_any |= bit
+				if t_opaque[id] == 1:
+					m_solid |= bit
+				if t_collide[id] == 1:
+					m_coll |= bit
+			bit <<= 1
+		any[ci] = m_any
+		solid[ci] = m_solid
+		coll[ci] = m_coll
+	return true
+
+
+## Publish the finished chunk: it becomes part of the world here and nowhere
+## else, which is what keeps the incremental fill invisible to everything.
+func _finish_chunk() -> void:
+	var ch := _building
+	var key := _build_key
+	_building = null
 	ch.generated = true
+	_chunks[key] = ch
 
 	# structures written into us by neighbours that generated first
 	var pend = _pending.get(key)
@@ -528,7 +680,9 @@ func _generate_chunk(key: Vector2i) -> void:
 			_write_raw(ch, e.x, e.y, e.z, e.w)
 		_pending.erase(key)
 
+	var pd := Prof.mark()
 	_decorate(ch)
+	Prof.add(&"gen.decorate", pd)
 
 	ch.dirty = true
 	_mesh_queue.append(key)
@@ -1307,6 +1461,15 @@ func _faces_to_arrays(fpos: PackedInt32Array, fmeta: PackedInt32Array) -> Array:
 	var th := 1.0 / float(TexGen.ATLAS_ROWS)
 	var eps := 0.0008
 
+	var uw := tw - eps * 2.0
+	var vh := th - eps * 2.0
+	# Hoisted out of the loop: every one of these was a Variant index or a heap
+	# allocation *per face*, and a surface chunk has several thousand faces.
+	var uv0: Vector2 = FLAT_UV[0]
+	var uv1: Vector2 = FLAT_UV[1]
+	var uv2: Vector2 = FLAT_UV[2]
+	var uv3: Vector2 = FLAT_UV[3]
+
 	var vi := 0
 	var ii := 0
 	for k in n:
@@ -1325,24 +1488,35 @@ func _faces_to_arrays(fpos: PackedInt32Array, fmeta: PackedInt32Array) -> Array:
 		var a2: int = (m >> 12) & 3
 		var a3: int = (m >> 14) & 3
 
-		# a touch of per-block tone jitter keeps big flat faces from banding
-		var tone := 0.93 + float(_hash3(x, y, z, 3) % 128) / 128.0 * 0.14
+		# A touch of per-block tone jitter keeps big flat faces from banding.
+		# Inlined rather than calling WorldGen.hash3: the call was one of the
+		# three most expensive things in the mesher purely by being a call.
+		var h := (x * 73856093) ^ (y * 19349663) ^ (z * 83492791)
+		h = (h ^ (h >> 13)) * 1274126177
+		var tone := 0.93 + float((h >> 7) & 127) / 128.0 * 0.14
 
 		var u0 := float(tile % TexGen.ATLAS_COLS) * tw + eps
 		var v0 := float(tile / TexGen.ATLAS_COLS) * th + eps
-		var uw := tw - eps * 2.0
-		var vh := th - eps * 2.0
 
 		var origin := Vector3(x, y, z)
-		var nrm: Vector3 = FACE_NORMAL[dir]
-		var vt: Array = FACE_VERTS[dir]
-		var aos := [a0, a1, a2, a3]
-		for j in 4:
-			verts[vi + j] = origin + vt[j]
-			norms[vi + j] = nrm
-			var uv: Vector2 = FACE_UV[j]
-			uvs[vi + j] = Vector2(u0 + uv.x * uw, v0 + uv.y * vh)
-			cols[vi + j] = Color(AO_LUT[aos[j]] * tone, emis, 1.0, 1.0)
+		var nrm: Vector3 = FLAT_NORMAL[dir]
+		var vb := dir * 4
+		verts[vi] = origin + FLAT_VERTS[vb]
+		verts[vi + 1] = origin + FLAT_VERTS[vb + 1]
+		verts[vi + 2] = origin + FLAT_VERTS[vb + 2]
+		verts[vi + 3] = origin + FLAT_VERTS[vb + 3]
+		norms[vi] = nrm
+		norms[vi + 1] = nrm
+		norms[vi + 2] = nrm
+		norms[vi + 3] = nrm
+		uvs[vi] = Vector2(u0 + uv0.x * uw, v0 + uv0.y * vh)
+		uvs[vi + 1] = Vector2(u0 + uv1.x * uw, v0 + uv1.y * vh)
+		uvs[vi + 2] = Vector2(u0 + uv2.x * uw, v0 + uv2.y * vh)
+		uvs[vi + 3] = Vector2(u0 + uv3.x * uw, v0 + uv3.y * vh)
+		cols[vi] = Color(FLAT_AO[a0] * tone, emis, 1.0, 1.0)
+		cols[vi + 1] = Color(FLAT_AO[a1] * tone, emis, 1.0, 1.0)
+		cols[vi + 2] = Color(FLAT_AO[a2] * tone, emis, 1.0, 1.0)
+		cols[vi + 3] = Color(FLAT_AO[a3] * tone, emis, 1.0, 1.0)
 
 		# Godot winds front faces clockwise; flip the quad's diagonal when the
 		# occlusion is asymmetric so the AO gradient stays smooth.
@@ -1530,11 +1704,25 @@ func _rebuild_fill() -> void:
 	# --- 1. the pocket. A plain flood through covered air, which is exactly
 	# "the airspace in which the player lies" and nothing else. The cover test is
 	# what stops a doorway leaking the flood into the open sky.
-	var seen := {}
+	#
+	# Visited cells are marked in a byte grid over the flood's own extent rather
+	# than kept in a set. Three thousand cells with six neighbours each is
+	# eighteen thousand membership tests, and hashing a `Vector3i` that many
+	# times was most of what this mode cost — the grid answers the same question
+	# with one multiply and one array read. It is allocated once and refilled.
+	var half_x := FILL_EXTENT.x / 2
+	var half_z := FILL_EXTENT.z / 2
+	var span_x := half_x * 2 + 1
+	var span_z := half_z * 2 + 1
+	if _flood_seen.size() < span_x * WH * span_z:
+		_flood_seen.resize(span_x * WH * span_z)
+	_flood_seen.fill(0)
+
 	var pocket: Array[Vector3i] = []
 	var queue: Array[Vector3i] = [start]
 	if is_covered(start.x, start.y, start.z) and not is_solid_at(start.x, start.y, start.z):
-		seen[start] = true
+		# the start cell sits at the centre of the grid by construction
+		_flood_seen[(half_x * WH + start.y) * span_z + half_z] = 1
 	else:
 		queue.clear()
 
@@ -1547,17 +1735,22 @@ func _rebuild_fill() -> void:
 		pocket.append(c)
 		lo = Vector3i(mini(lo.x, c.x), mini(lo.y, c.y), mini(lo.z, c.z))
 		hi = Vector3i(maxi(hi.x, c.x), maxi(hi.y, c.y), maxi(hi.z, c.z))
-		for d: Vector3i in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0),
-				Vector3i(0, -1, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
+		# NEIGHBOURS is a constant, not a literal written here: an array literal
+		# inside a loop is rebuilt on every iteration, and this one ran three
+		# thousand times a rebuild.
+		for d: Vector3i in NEIGHBOURS:
 			var n: Vector3i = c + d
-			if seen.has(n):
+			var ux := n.x - start.x + half_x
+			var uz := n.z - start.z + half_z
+			if ux < 0 or uz < 0 or ux >= span_x or uz >= span_z \
+					or n.y < 0 or n.y >= WH:
 				continue
-			if absi(n.x - start.x) > FILL_EXTENT.x / 2 \
-					or absi(n.z - start.z) > FILL_EXTENT.z / 2:
+			var mi := (ux * WH + n.y) * span_z + uz
+			if _flood_seen[mi] != 0:
 				continue
+			_flood_seen[mi] = 1
 			if is_solid_at(n.x, n.y, n.z) or not is_covered(n.x, n.y, n.z):
 				continue
-			seen[n] = true
 			queue.append(n)
 
 	if pocket.is_empty():
@@ -1726,7 +1919,7 @@ func _rebuild_caps() -> void:
 			if not cut.fill_cells.is_empty():
 				_caps_from_cells()
 		else:
-			_caps_from_bounds()
+			_caps_from_cylinder()
 
 	_cap_mesh.clear_surfaces()
 	if _cap_cells.is_empty():
@@ -1824,6 +2017,88 @@ func _caps_from_plane() -> void:
 					| ((top - y) << 24))
 				y = top
 			across += 1
+
+
+## The cylinder's cross-section, found by walking the drill instead of the box
+## that contains it.
+##
+## The drill is a capsule perhaps three blocks across bored through thirty of
+## world; the axis-aligned box around it is some eight thousand cells. Testing
+## all eight thousand to find the three hundred that are actually cut was, by
+## the profiler, the single largest recurring cost in the frame — and it ran
+## again on every block the player moved, because a line from the lens to the
+## player genuinely does depend on both.
+##
+## So this marches the segment instead, and only looks at cells near it. The
+## marker grid is what makes that safe: consecutive samples overlap heavily, and
+## a cell must be offered to `_cap_neighbours` exactly once or the cross-section
+## grows duplicate coplanar faces. It is indexed arithmetically rather than
+## hashed, which is the difference between this and a Dictionary of visited
+## cells.
+##
+## `_caps_from_bounds` is kept as the reference implementation. It is the same
+## predicate walked exhaustively, and the smoke test holds the two to producing
+## identical geometry.
+func _caps_from_cylinder() -> void:
+	var cut := cutaway
+	var cam := cut.camera_position
+	var bounds := cut.get_int_bounds()
+	# Exactly the window `_caps_from_bounds` walks, so the two are comparable.
+	var ox := int(bounds.position.x)
+	var oz := int(bounds.position.z)
+	var y0 := maxi(int(bounds.position.y), 0)
+	var y1 := mini(int(bounds.end.y), WH)
+	var w := int(bounds.size.x)
+	var h := y1 - y0
+	var d := int(bounds.size.z)
+	if w <= 0 or h <= 0 or d <= 0:
+		return
+	if _cap_seen.size() < w * h * d:
+		_cap_seen.resize(w * h * d)
+	_cap_seen.fill(0)
+
+	var seg := cut.target_position - cam
+	# One sample per block of the drill, so no point on the segment is more than
+	# half a block from a sample.
+	var steps := maxi(int(ceil(seg.length())), 1)
+	# A cut cell's centre lies within the drill's radius of the segment, so
+	# within that plus the half-block sampling error of some sample, so within
+	# that many cells of that sample's own cell. Nothing outside this can be
+	# cut, whatever the keep shell does — the shell only ever removes.
+	#
+	# Only the sample at the player's end needs the wider radius: that is the
+	# spherical cap that keeps them visible pressed against a wall, and paying
+	# for it along the whole shaft is three times the cells for nothing.
+	var shaft := int(ceil(cut.radius + 0.5))
+	var capped := int(ceil(cut.radius + cut.target_padding + 0.5))
+
+	for s in steps + 1:
+		var pt := cam + seg * (float(s) / float(steps))
+		var px := floori(pt.x)
+		var py := floori(pt.y)
+		var pz := floori(pt.z)
+		var reach := capped if s == steps else shaft
+		for dx in range(-reach, reach + 1):
+			var lx := px + dx - ox
+			if lx < 0 or lx >= w:
+				continue
+			var x := ox + lx
+			for dy in range(-reach, reach + 1):
+				var ly := py + dy - y0
+				if ly < 0 or ly >= h:
+					continue
+				var y := y0 + ly
+				var row := (lx * h + ly) * d
+				for dz in range(-reach, reach + 1):
+					var lz := pz + dz - oz
+					if lz < 0 or lz >= d:
+						continue
+					var mi := row + lz
+					if _cap_seen[mi] != 0:
+						continue
+					_cap_seen[mi] = 1
+					if cut.is_cut(x, y, oz + lz):
+						_cap_neighbours(x, y, oz + lz, cam)
 
 
 func _caps_from_bounds() -> void:

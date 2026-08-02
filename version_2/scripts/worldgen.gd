@@ -59,6 +59,11 @@ var _blend: FastNoiseLite
 var _cave: FastNoiseLite
 var _ore: FastNoiseLite
 
+## Stratum host blocks, resolved once per planet. See `_host_at`.
+var _id_core := 0
+var _id_deep := 0
+var _id_mantle := 0
+
 
 func _init() -> void:
 	configure({})
@@ -75,6 +80,13 @@ func configure(cfg: Dictionary) -> void:
 	star = cfg.get("star", Color(1, 1, 1))
 	palette = _palette_for(biome)
 	_init_noise()
+	# A different planet is a different surface; the cache cannot outlive it.
+	_hc_key.resize(HEIGHT_CACHE)
+	_hc_val.resize(HEIGHT_CACHE)
+	_hc_val.fill(0)
+	_id_core = _b(&"corestone")
+	_id_deep = _b(&"deepstone")
+	_id_mantle = _b(&"mantle_stone")
 
 
 func _init_noise() -> void:
@@ -308,26 +320,60 @@ static func hash3(x: int, y: int, z: int, salt: int) -> int:
 	return absi(h ^ (h >> 16))
 
 
+## How many columns the height cache remembers. Must be a power of two.
+##
+## Direct-mapped and fixed size on purpose. A dictionary keyed by column would
+## be a better cache and an unbounded one: this is asked about every column the
+## player has ever walked over, and over a long session that dictionary is a
+## leak with a good hit rate. A fixed table cannot grow, needs no eviction
+## policy, and access here is spatially coherent enough that collisions are
+## rare — a structure probing its footprint and the generator filling a chunk
+## both sweep a small rectangle.
+const HEIGHT_CACHE := 8192
+var _hc_key := PackedInt64Array()
+var _hc_val := PackedInt32Array()
+
+
+## The surface at a column.
+##
+## Three noise lookups, and it is asked for far more often than there are
+## columns: the generator wants every column of a chunk, each structure probes
+## its whole footprint for flatness before it commits, and the trees and grass
+## ask again. Caching it took the largest single bite out of chunk generation.
 func surface_height(gx: int, gz: int) -> int:
 	if flat:
 		return 22
+	var key := (gx << 32) | (gz & 0xffffffff)
+	var slot := int((gx * 73856093) ^ (gz * 19349663)) & (HEIGHT_CACHE - 1)
+	# A height is always clamped into [5, WH - 8], so zero can stand for "this
+	# slot has never been written" and the table needs no separate valid bit.
+	if _hc_val[slot] != 0 and _hc_key[slot] == key:
+		return _hc_val[slot]
 	var base := 22.0
 	base += _height.get_noise_2d(gx, gz) * palette.amplitude
 	base += _hill.get_noise_2d(gx, gz) * 1.9 * palette.roughness
 	var m := _mountain.get_noise_2d(gx, gz)
 	if m > 0.36:
 		base += (m - 0.36) * 17.0
-	return clampi(int(round(base)), 5, WH - 8)
+	var out := clampi(int(round(base)), 5, WH - 8)
+	_hc_key[slot] = key
+	_hc_val[slot] = out
+	return out
 
 
 ## Which stratum block hosts ore at this depth.
+##
+## The four ids are resolved once in `configure` rather than here. This is asked
+## about every voxel below the crust — some seven thousand times per chunk — and
+## `Blocks.id(&"corestone")` is a StringName lookup in a dictionary, which made
+## naming the rock the most expensive thing about generating it.
 func _host_at(y: int) -> int:
 	if y < CORE_TOP:
-		return _b(&"corestone")
+		return _id_core
 	if y < DEEP_TOP:
-		return _b(&"deepstone")
+		return _id_deep
 	if y < MID_TOP:
-		return _b(&"mantle_stone")
+		return _id_mantle
 	return palette.filler
 
 
@@ -336,6 +382,12 @@ func _host_at(y: int) -> int:
 func _ore_at(gx: int, y: int, gz: int) -> int:
 	# chunky 2x2x2 clusters, cheap integer hash
 	var hv := hash3(gx >> 1, y >> 1, gz >> 1, 7) % 1000
+	# No branch below reaches past 90 in a thousand, so this cell cannot be ore
+	# whatever the vein noise says — and asking the noise is the single most
+	# expensive thing in the generator. Testing the free gate first skips nine
+	# calls in ten. The two tests are independent, so the ore field is unchanged.
+	if hv >= 90:
+		return Blocks.AIR
 	var vein := _ore.get_noise_3d(float(gx), float(y) * 1.6, float(gz))
 	if vein < 0.18:
 		return Blocks.AIR

@@ -552,7 +552,7 @@ func break_block(b: Vector3i, tool_tier: int) -> void:
 	var yields := def.roll_drops(tool_tier, rng)
 	if yields.is_empty() and def.drops.is_empty() and tool_tier >= def.tier:
 		yields.append([Items.item_of_block(id), 1])
-	world.set_block(b.x, b.y, b.z, Blocks.AIR)
+	world.edit_block(b.x, b.y, b.z, Blocks.AIR)
 	if game != null:
 		game.on_block_broken(b, id, yields)
 
@@ -584,7 +584,7 @@ func try_place() -> bool:
 		return false
 	if not _placement_is_clear(cell):
 		return false
-	if not world.set_block(cell.x, cell.y, cell.z, Blocks.id(t.place_block)):
+	if not world.edit_block(cell.x, cell.y, cell.z, Blocks.id(t.place_block)):
 		return false
 	stack.count -= 1
 	if stack.count <= 0:

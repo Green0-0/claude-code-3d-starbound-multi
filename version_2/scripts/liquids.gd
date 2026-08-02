@@ -15,6 +15,17 @@ const GROW_INTERVAL := 1.0
 ## How far a liquid will spread horizontally from its source before it stops.
 const MAX_SPREAD := 6
 
+## Step tables, as constants. Each of these sat as an array literal inside a
+## loop that runs hundreds of times per flow tick, and a literal in a loop body
+## is a fresh heap allocation on every pass.
+const LATERAL := [
+	Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1),
+]
+const SELF_AND_NEIGHBOURS := [
+	Vector3i.ZERO, Vector3i.UP, Vector3i.DOWN, Vector3i(1, 0, 0),
+	Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1),
+]
+
 var world: VoxelWorld
 var game: Node
 
@@ -37,8 +48,7 @@ func _init() -> void:
 
 ## Called whenever a block changes, so the sim only ever looks at what moved.
 func on_block_changed(at: Vector3i) -> void:
-	for d: Vector3i in [Vector3i.ZERO, Vector3i.UP, Vector3i.DOWN, Vector3i(1, 0, 0),
-			Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
+	for d: Vector3i in SELF_AND_NEIGHBOURS:
 		var c := at + d
 		var id := world.get_block(c.x, c.y, c.z)
 		if Blocks.is_liquid(id):
@@ -114,8 +124,7 @@ func _spread(c: Vector3i, id: int) -> void:
 		return
 	# then sideways, but only if there is something to stand on
 	var spread := 0
-	for d: Vector3i in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1),
-			Vector3i(0, 0, -1)]:
+	for d: Vector3i in LATERAL:
 		var side := c + d
 		if not _can_flow_into(side):
 			continue
@@ -157,8 +166,7 @@ func _set_liquid(c: Vector3i, id: int) -> void:
 	# lava meeting water becomes stone, which is the only interaction worth having
 	var neighbour_water := false
 	var neighbour_lava := false
-	for d: Vector3i in [Vector3i.UP, Vector3i.DOWN, Vector3i(1, 0, 0),
-			Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
+	for d: Vector3i in VoxelWorld.NEIGHBOURS:
 		var n := world.get_block(c.x + d.x, c.y + d.y, c.z + d.z)
 		if not Blocks.is_liquid(n):
 			continue

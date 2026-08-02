@@ -25,10 +25,24 @@ var _body: Node3D
 var _anim := 0.0
 
 
+## Build one, unless that cell is already taken.
+##
+## Nothing may stack two objects in a cell, and the rule lives here because the
+## case that needed it is not the obvious one. Structures queue themselves again
+## every time their chunk regenerates, which is how a village comes back when
+## the player returns to it — but objects, unlike villagers, are saved and are
+## never unloaded, because a chest may have the player's things in it. So each
+## return trip laid a fresh chest inside the old one. Refusing here keeps the
+## first one, contents and all, and keeps the count bounded by the world rather
+## than by how often it has been walked across.
 static func create(parent: Node, g: Node, id: StringName, at: Vector3i) -> PlacedObject:
 	var d := ObjectDB.get_def(id)
 	if d == null:
 		return null
+	for n in parent.get_children():
+		var existing := n as PlacedObject
+		if existing != null and existing.cell == at:
+			return null
 	var o := PlacedObject.new()
 	o.def = d
 	o.cell = at

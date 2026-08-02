@@ -874,7 +874,44 @@ static func build_character() -> ImageTexture:
 
 ## A villager: the same chibi build as the player, recoloured per role and
 ## varied by seed, so a settlement reads as a crowd rather than as one clone.
+## Generated sprite sheets, kept rather than rebuilt.
+##
+## Both builders below draw a six-frame sheet pixel by pixel, which is tens of
+## thousands of `set_pixel` calls. Nothing about that is wrong once — but a
+## creature sheet depends only on its *species*, and creatures respawn around
+## the player for as long as the game runs, so it was being redrawn from scratch
+## every few seconds forever. Villagers are the same story with a slower clock:
+## a village arriving would draw half a dozen sheets on one frame, which was the
+## worst spike left in the population tick.
+##
+## Both key spaces are small and closed — a fixed roster of species, and a
+## deliberately small number of faces per role — so the cache has a ceiling
+## rather than a growth rate. The cap is a backstop against a future caller with
+## a wider key, not something normal play reaches.
+const SPRITE_CACHE_CAP := 512
+static var _sprite_cache := {}
+
+
+static func _cached_sprite(key: String, build: Callable) -> ImageTexture:
+	var hit = _sprite_cache.get(key)
+	if hit != null:
+		return hit
+	if _sprite_cache.size() >= SPRITE_CACHE_CAP:
+		_sprite_cache.clear()
+	var made: ImageTexture = build.call()
+	_sprite_cache[key] = made
+	return made
+
+
+## `seed_v` is expected to be a small variant index rather than a raw random
+## int; see `Npc.spawn`. A unique seed per villager would make this a cache with
+## no hits and unbounded keys, which is worse than no cache at all.
 static func build_npc(coat_col: Color, accent: Color, seed_v: int) -> ImageTexture:
+	return _cached_sprite("npc:%s:%s:%d" % [coat_col, accent, seed_v],
+		func() -> ImageTexture: return _draw_npc(coat_col, accent, seed_v))
+
+
+static func _draw_npc(coat_col: Color, accent: Color, seed_v: int) -> ImageTexture:
 	var img := Image.create(CH_W * CH_FRAMES, CH_H, false, Image.FORMAT_RGBA8)
 	img.fill(Color(0, 0, 0, 0))
 	var r := _rng(seed_v)
@@ -944,6 +981,12 @@ const MB_SQUASH := [0.0, 0.14, 0.0, -0.11]
 ## Four frames of squash-and-stretch, drawn silhouette-first so it still reads
 ## at HD-2D distances and through a cross-section.
 static func build_creature(shape: StringName, tint: Color, alt: Color,
+		features: Dictionary) -> ImageTexture:
+	return _cached_sprite("mob:%s:%s:%s:%s" % [shape, tint, alt, features],
+		func() -> ImageTexture: return _draw_creature(shape, tint, alt, features))
+
+
+static func _draw_creature(shape: StringName, tint: Color, alt: Color,
 		features: Dictionary) -> ImageTexture:
 	var img := Image.create(MB_W * MB_FRAMES, MB_H, false, Image.FORMAT_RGBA8)
 	img.fill(Color(0, 0, 0, 0))

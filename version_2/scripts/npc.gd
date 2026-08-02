@@ -31,6 +31,8 @@ var _anim := 0.0
 var _hit_floor := false
 var on_floor := false
 var _seed := 0
+## Which of the cached face variants this villager wears. See `spawn`.
+var _face := 0
 
 var sprite: Sprite3D
 var _tag: Label3D
@@ -49,6 +51,12 @@ static func spawn(parent: Node, w: VoxelWorld, p: Player, g: Node,
 	n.role = r
 	n.npc_name = NpcRoles.random_name(rng)
 	n._seed = rng.randi()
+	# The sprite sheet is cached by role and variant, so the number of distinct
+	# faces has to be a small closed set rather than one per villager ever
+	# spawned. Sixteen per role is more variety than a village can show at once,
+	# and the greeting and idle lines still use the full seed, so two villagers
+	# who look alike do not sound alike.
+	n._face = n._seed & 15
 	parent.add_child(n)
 	n.global_position = at
 	n._home = at
@@ -59,7 +67,7 @@ static func spawn(parent: Node, w: VoxelWorld, p: Player, g: Node,
 func _ready() -> void:
 	add_to_group(&"npcs")
 	sprite = Sprite3D.new()
-	sprite.texture = TexGen.build_npc(role.color, role.accent, _seed)
+	sprite.texture = TexGen.build_npc(role.color, role.accent, _face)
 	sprite.hframes = TexGen.CH_FRAMES
 	sprite.pixel_size = 1.85 / float(TexGen.CH_H)
 	sprite.billboard = BaseMaterial3D.BILLBOARD_FIXED_Y

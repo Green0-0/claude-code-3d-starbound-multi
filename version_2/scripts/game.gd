@@ -13,6 +13,11 @@ extends Node3D
 const MAX_MONSTERS := 22
 const MAX_DROPS := 180
 const SPAWN_INTERVAL := 3.5
+## How far an unsaved entity may be from the player before it is unloaded.
+## Comfortably inside the distance at which chunks themselves are culled.
+const DESPAWN_RANGE := 96.0
+## How long one population tick may spend building structure entities.
+const POPULATE_BUDGET_US := 3000
 const AUTOSAVE_INTERVAL := 120.0
 const SAVE_PATH := "user://voxelbound_save.json"
 
@@ -47,6 +52,11 @@ var stats := {}
 var _booted := false
 var _spawn_timer := 0.0
 var _autosave := AUTOSAVE_INTERVAL
+## Structures whose population is currently standing, by origin. Bounded: an
+## entry is forgotten as soon as the player is far enough away that its entities
+## have been unloaded. See `_populate_structures`.
+var _populated := {}
+
 var _rng := RandomNumberGenerator.new()
 var _pending_spawn := Vector3.ZERO
 var _hand_station := Crafting.Station.new(&"hand")
@@ -188,14 +198,29 @@ func _process(delta: float) -> void:
 	if not _booted:
 		return
 
+	var t := Prof.mark()
 	world.focus_on(player.global_position)
+	Prof.add(&"stream.focus", t)
+
+	t = Prof.mark()
 	_sync_cutaway()
+	Prof.add(&"cutaway.sync", t)
+
+	t = Prof.mark()
 	sky.tick(delta)
 	sky.follow(player.global_position)
+	Prof.add(&"sky", t)
+
+	t = Prof.mark()
 	liquids.tick(delta)
+	Prof.add(&"liquids", t)
+
+	t = Prof.mark()
 	tech.tick(delta)
 	_update_environment()
+	Prof.add(&"tech+env", t)
 
+	t = Prof.mark()
 	var mouse := get_viewport().get_mouse_position()
 	if not input_locked:
 		player.update_aim(rig.camera, mouse)
@@ -208,22 +233,30 @@ func _process(delta: float) -> void:
 	else:
 		highlight.visible = false
 		player.cancel_mine()
+	Prof.add(&"aim", t)
 
 	_spawn_timer -= delta
 	if _spawn_timer <= 0.0:
 		_spawn_timer = SPAWN_INTERVAL
+		t = Prof.mark()
 		_tick_population()
+		Prof.add(&"population", t)
 
 	_autosave -= delta
 	if _autosave <= 0.0:
 		_autosave = AUTOSAVE_INTERVAL
+		t = Prof.mark()
 		save_game()
+		Prof.add(&"autosave", t)
 
 	# depth is a quest objective, and worth a note the first time
 	var y: int = int(floor(player.global_position.y))
 	if y < _deepest:
 		_deepest = y
 		quests.on_depth(y)
+
+	# The game owns the frame, so the game closes the profiler's books on it.
+	Prof.end_frame()
 
 
 ## The single point where camera state becomes cutaway state. Everything else —
@@ -426,7 +459,7 @@ func explode(centre: Vector3, radius: float, damage: float,
 				var def := Blocks.get_def(id)
 				if not def.breakable or def.blast > radius * 12.0:
 					continue
-				world.set_block(cell.x, cell.y, cell.z, Blocks.AIR)
+				world.edit_block(cell.x, cell.y, cell.z, Blocks.AIR)
 				if _rng.randf() < 0.25:
 					var drops := def.roll_drops(99, _rng)
 					for pair: Array in drops:
@@ -555,7 +588,7 @@ func _till(who: Player) -> bool:
 		return false
 	if world.get_block(cell.x, cell.y + 1, cell.z) != Blocks.AIR:
 		return false
-	world.set_block(cell.x, cell.y, cell.z, Blocks.id(&"tilled_soil"))
+	world.edit_block(cell.x, cell.y, cell.z, Blocks.id(&"tilled_soil"))
 	return false            # tools are never consumed
 
 
@@ -564,7 +597,7 @@ func _water(who: Player) -> bool:
 	if cell == Player.NO_CELL:
 		return false
 	if Blocks.get_def(world.get_block(cell.x, cell.y, cell.z)).tags.has(&"tilled"):
-		world.set_block(cell.x, cell.y, cell.z, Blocks.id(&"watered_soil"))
+		world.edit_block(cell.x, cell.y, cell.z, Blocks.id(&"watered_soil"))
 	return false
 
 
@@ -582,7 +615,7 @@ func _plant_seed(who: Player, stack: Items.Stack, t: Items.Type) -> bool:
 	var stage0 := Blocks.id(CropTable.stage_block_name(t.seed_crop, 0))
 	if stage0 == Blocks.AIR:
 		return false
-	world.set_block(above.x, above.y, above.z, stage0)
+	world.edit_block(above.x, above.y, above.z, stage0)
 	stack.count -= 1
 	if stack.count <= 0:
 		stack.clear()
@@ -1248,14 +1281,42 @@ func spawn_impact(at: Vector3, col: Color) -> void:
 # =============================================================================
 
 func _tick_population() -> void:
-	if not world.gen.hostiles:
-		return
-	if monsters_root.get_child_count() < MAX_MONSTERS:
-		_spawn_monster_near_player()
-	for n in monsters_root.get_children():
-		var m := n as Monster
-		if m != null and m.global_position.distance_to(player.global_position) > 70.0:
-			m.queue_free()
+	var here := player.global_position
+	if world.gen.hostiles:
+		if monsters_root.get_child_count() < MAX_MONSTERS:
+			_spawn_monster_near_player()
+		for n in monsters_root.get_children():
+			var m := n as Monster
+			if m != null and m.global_position.distance_to(here) > 70.0:
+				m.queue_free()
+
+	# Villagers unload with the ground they stand on.
+	#
+	# They are not in the save file, because they are a property of the
+	# structure they belong to and the structure queues them again when the
+	# player comes back. That makes them safe to drop, and dropping them is the
+	# only reason walking the same road for an hour does not end in a thousand
+	# of them each running a swept collision step every physics frame.
+	#
+	# Placed objects are the exact opposite and are deliberately not touched
+	# here: they *are* saved, and a chest may have the player's things in it.
+	for n in npcs_root.get_children():
+		var npc := n as Npc
+		if npc != null and npc.global_position.distance_to(here) > DESPAWN_RANGE:
+			npc.queue_free()
+
+	# Once a structure's population is gone it is eligible to stand again. The
+	# range is comfortably inside the distance at which chunks are culled, so a
+	# structure is always forgotten before its chunk can regenerate and requeue
+	# it — there is no window in which both the old villagers and a fresh spec
+	# exist, which is what used to double the roster on every return trip.
+	for at: Vector3i in _populated.keys():
+		if Vector3(at).distance_to(here) > DESPAWN_RANGE:
+			_populated.erase(at)
+
+	# Not inside the `hostiles` guard: a peaceful planet still has villages, and
+	# leaving this behind the guard meant their specs queued up and were never
+	# consumed for as long as the player stayed.
 	_populate_structures()
 
 
@@ -1339,15 +1400,40 @@ func _summon_boss(at: Vector3) -> void:
 
 
 ## Fill in the entities that structures asked for once their chunks are live.
+##
+## Three rules, and the queue is bounded and idempotent because of them:
+##
+##   * A structure already standing is skipped and its spec dropped. Chunk
+##     regeneration queues the same structure again every time the player walks
+##     back, which is how a village returns — but without this it also spawns a
+##     second one on top of the first, and a third, forever.
+##   * A spec whose chunk is no longer resident is dropped rather than carried.
+##     Carrying it was an unbounded queue: a structure at the edge of the view
+##     that the player then walked away from stayed in this array for the rest
+##     of the session, and every tick walked past it. Dropping loses nothing —
+##     regenerating that chunk is exactly what queues it again.
+##   * Populating is capped by time, not by count. A village is a dozen nodes
+##     with meshes and lights, three of them landing on one frame was a sixty
+##     millisecond stall, and there is no hurry: the rest land next tick.
 func _populate_structures() -> void:
 	if world.pending_structures.is_empty():
 		return
+	var t0 := Time.get_ticks_usec()
 	var still: Array = []
 	for spec: Dictionary in world.pending_structures:
 		var at: Vector3i = spec["at"]
+		if _populated.has(at):
+			continue
 		if not world.is_loaded(at.x, at.z):
+			continue
+		# Checked before each structure, so it bounds how many land on a frame
+		# but not how long the one in progress takes. That is why the sprite
+		# sheets a village needs are cached rather than drawn on arrival — the
+		# budget can only stop the *next* village, never the current one.
+		if Time.get_ticks_usec() - t0 >= POPULATE_BUDGET_US:
 			still.append(spec)
 			continue
+		_populated[at] = true
 		match StringName(spec["kind"]):
 			&"village": _populate_village(spec)
 			&"camp": _populate_camp(spec)
@@ -1366,11 +1452,23 @@ func _populate_village(spec: Dictionary) -> void:
 
 
 func _populate_camp(spec: Dictionary) -> void:
+	# A camp is a nest of hostiles, so a planet that has none has no camps
+	# either. This used to be enforced by accident — the whole population tick
+	# sat behind the same flag, which also meant villages never populated on a
+	# peaceful world — and saying it here is what let that be fixed.
+	if not world.gen.hostiles:
+		return
 	var at: Vector3i = spec["at"]
 	var pool := SpeciesDB.pool_for(world.gen.biome, world.gen.threat + 2)
 	if pool.is_empty():
 		return
-	for i in int(spec.get("count", 3)):
+	# A camp draws from the same population budget as the ambient spawner rather
+	# than adding to it. It used to bypass it entirely, and `spawn_monster` has a
+	# hard ceiling a little above MAX_MONSTERS that silently refuses past it — so
+	# a run of camps could fill the world to that ceiling and then quietly block
+	# every spawn the game actually needed, a boss or a quest target included.
+	var room := MAX_MONSTERS - monsters_root.get_child_count()
+	for i in mini(int(spec.get("count", 3)), room):
 		var def: SpeciesDB.Def = pool[_rng.randi() % pool.size()]
 		spawn_monster(def.id, Vector3(at) + Vector3(_rng.randf_range(-3, 3), 0.4,
 			_rng.randf_range(-3, 3)), 1.1 + float(world.gen.threat) * 0.25)

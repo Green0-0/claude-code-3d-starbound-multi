@@ -398,6 +398,19 @@ static func tile_of(block_id: int, face: int) -> int:
 	return _tiles[block_id * 3 + 1]
 
 
+## The raw tables, for the two loops that run once per *voxel* rather than once
+## per block: the chunk generator folding a column into its bitmasks, and the
+## mesher. At twelve thousand voxels a chunk the call overhead of `is_opaque`
+## dwarfs the array read inside it, and a local `var op := Blocks.opaque_table()`
+## outside the loop turns the call into an index. Nowhere else should need this.
+static func opaque_table() -> PackedByteArray:
+	return _opaque
+
+
+static func collide_table() -> PackedByteArray:
+	return _collide
+
+
 static func is_opaque(block_id: int) -> bool:
 	return _opaque[block_id] == 1
 

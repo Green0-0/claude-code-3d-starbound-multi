@@ -86,6 +86,9 @@ func _run() -> void:
 	print("== cutaway modes")
 	await _cutaway_modes()
 
+	print("== resource budgets")
+	await _budgets()
+
 	print("== space")
 	_space()
 
@@ -480,7 +483,8 @@ func _taming() -> void:
 	# --- passive route
 	var y: Monster = game.spawn_monster(&"yokat",
 		Vector3(feet.x + 7, feet.y + 1, feet.z), 1.0)
-	check("a creature spawns to tame", y != null)
+	check("a creature spawns to tame", y != null,
+		"%d creatures already standing" % game.monsters_root.get_child_count())
 	if y != null:
 		y.alert = 0.0
 		y.fear = 0.0
@@ -534,12 +538,18 @@ func _taming() -> void:
 		check("a tame has an inventory you can fill",
 			left == 0 and y.carried_count() == 12,
 			"%d slots, %d left over" % [y.carry_capacity, left])
-		var drops_before: int = game.drops_root.get_child_count()
+		# Counted by item, not by node. `ItemDrop.spawn` rolls a new drop into a
+		# nearby one of the same thing rather than carpeting the floor, so
+		# "another child appeared" is not the promise — "the cobblestone is on
+		# the ground" is, and it holds whether or not it merged.
+		var stone_before := _dropped_count(&"cobblestone")
 		y.drop_inventory()
 		await _settle(3)
 		check("what it carries comes back when it dies",
-			game.drops_root.get_child_count() > drops_before
-			and y.carried_count() == 0)
+			_dropped_count(&"cobblestone") == stone_before + 12
+			and y.carried_count() == 0,
+			"%d -> %d cobblestone, %d still carried" % [stone_before,
+				_dropped_count(&"cobblestone"), y.carried_count()])
 		y.queue_free()
 	player.crouching = false
 
@@ -884,6 +894,7 @@ func _cutaway_modes() -> void:
 		cut.plane_coord() != plane_here)
 
 	_planar_faces(cam, target)
+	_cylinder_march(cam, target)
 
 	world.update_cutaway(cam, target)
 	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
@@ -959,14 +970,19 @@ func _cutaway_modes() -> void:
 	# This is the ghost. The chunk remesh used to sit in the same time-budgeted
 	# queue as terrain streaming, so under load — which in a cut mode is most of
 	# the time — a destroyed block could keep its faces for many frames. Player
-	# edits now jump that queue, and this holds them to it in every mode.
+	# edits jump that queue, and this holds them to it in every mode.
+	#
+	# `edit_block` and not `set_block` on purpose: the promise is about a block
+	# the *player* just broke. Water finding its level and wheat growing a stage
+	# also write blocks, several a second and forever, and letting those jump
+	# the queue as well was the largest single source of stutter in the game.
 	for mode: int in [Cutaway.Mode.CYLINDER, Cutaway.Mode.FILL, Cutaway.Mode.PLANAR]:
 		world.set_cutaway_mode(mode)
 		var cell := Vector3i(feet2.x + 2, feet2.y + 1, feet2.z)
-		world.set_block(cell.x, cell.y, cell.z, Blocks.STONE)
+		world.edit_block(cell.x, cell.y, cell.z, Blocks.STONE)
 		await _settle(4)
 		var standing := _own_faces_at(cell)
-		world.set_block(cell.x, cell.y, cell.z, Blocks.AIR)
+		world.edit_block(cell.x, cell.y, cell.z, Blocks.AIR)
 		await _settle(1)
 		check("%s: a destroyed block is gone the next frame" % cut.mode_name(),
 			standing > 0 and _own_faces_at(cell) == 0,
@@ -1097,6 +1113,128 @@ func _planar_faces(cam: Vector3, target: Vector3) -> void:
 
 	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
 	world.update_cutaway(cam, target)
+
+
+## The drill's cross-section, marched, must equal the drill's cross-section
+## walked exhaustively.
+##
+## `_caps_from_cylinder` only looks at cells near the segment instead of at
+## every cell of the box around it, which is worth several milliseconds a frame
+## — but only if it cannot miss one. That is an argument about the reach of a
+## capsule and the spacing of the samples, and an argument is not a proof, so
+## here both are run over real terrain from several angles and the geometry is
+## compared cell for cell.
+func _cylinder_march(cam: Vector3, target: Vector3) -> void:
+	world.set_cutaway_mode(Cutaway.Mode.CYLINDER)
+	var mismatched := 0
+	var probed := 0
+	var emitted := 0
+
+	for i in 8:
+		var a := float(i) * TAU / 8.0
+		var lens := target + Vector3(cos(a) * 20.0, 9.0 + float(i), sin(a) * 20.0)
+		world.update_cutaway(lens, target)
+
+		world._cap_cells.clear()
+		world._cap_meta.clear()
+		world._caps_from_cylinder()
+		var fast := _cap_set()
+
+		world._cap_cells.clear()
+		world._cap_meta.clear()
+		world._caps_from_bounds()
+		var slow := _cap_set()
+
+		probed += 1
+		emitted += slow.size()
+		if fast != slow:
+			mismatched += 1
+
+	check("the marched drill matches the exhaustive walk exactly",
+		mismatched == 0 and emitted > 0,
+		"%d of %d angles differ, %d faces compared" % [mismatched, probed, emitted])
+
+
+## The cap set as a comparable value: cell and packed face, order-independent.
+func _cap_set() -> Dictionary:
+	var out := {}
+	for i in world._cap_meta.size():
+		var c: Vector3 = world._cap_cells[i]
+		out["%d,%d,%d,%d" % [int(c.x), int(c.y), int(c.z), world._cap_meta[i]]] = true
+	return out
+
+
+## The rules that keep a long session from getting slower than a short one.
+##
+## Every one of these was a real, measured cost: a sprite sheet redrawn pixel by
+## pixel on each respawn, a structure repopulated on each return trip, a nest of
+## creatures that ignored the population ceiling, a queue that only ever grew.
+## They are cheap to assert and expensive to rediscover, and none of them shows
+## up in a test that runs for ten seconds — which is why they are asserted here
+## rather than left to `tools/soak.gd` to notice an hour in.
+func _budgets() -> void:
+	# --- generated sprite sheets are drawn once per distinct look, not per spawn
+	var sp := SpeciesDB.get_def(&"poptop")
+	check("a creature's sprite sheet is drawn once, not per spawn",
+		sp != null and TexGen.build_creature(sp.shape, sp.color, sp.alt, sp.features)
+		== TexGen.build_creature(sp.shape, sp.color, sp.alt, sp.features))
+	check("villagers draw from a closed set of faces",
+		TexGen.build_npc(Color.RED, Color.BLUE, 3)
+		== TexGen.build_npc(Color.RED, Color.BLUE, 3))
+
+	# --- a structure populates once, however often its chunk is regenerated
+	var at := player.feet_block() + Vector3i(4, 0, 4)
+	var spec := {"kind": &"mineshaft", "at": at}
+	world.pending_structures = [spec]
+	game._populate_structures()
+	await _settle(2)
+	var after_first: int = game.objects_root.get_child_count()
+	# exactly what a return trip does: the chunk regenerates and queues it again
+	world.pending_structures = [spec.duplicate()]
+	game._populate_structures()
+	await _settle(2)
+	check("a structure regenerating does not populate it twice",
+		game.objects_root.get_child_count() == after_first,
+		"%d -> %d objects" % [after_first, game.objects_root.get_child_count()])
+	check("and its spec is consumed rather than carried forever",
+		world.pending_structures.is_empty(),
+		"%d left queued" % world.pending_structures.size())
+
+	# --- nothing may stack two objects in one cell, whoever asks
+	var dup := PlacedObject.create(game.objects_root, game, &"chest", at)
+	check("two objects cannot occupy one cell", dup == null)
+
+	# --- a nest of creatures draws from the population budget, not around it
+	# Asked for a thousand. It may take the population up to the ceiling and no
+	# further — and if scripted spawns have already carried it past (the tests
+	# above summon their own), it may add nothing at all.
+	var before: int = game.monsters_root.get_child_count()
+	game._populate_camp({"kind": &"camp", "at": at, "count": 999})
+	var after: int = game.monsters_root.get_child_count()
+	check("a camp cannot spawn past the creature ceiling",
+		after <= maxi(before, game.MAX_MONSTERS),
+		"%d -> %d, ceiling %d" % [before, after, game.MAX_MONSTERS])
+
+	# --- and the simulation's own writes stay off the unbudgeted remesh path
+	var cell := player.feet_block() + Vector3i(0, 3, 0)
+	world._edit_dirty.clear()
+	world.set_block(cell.x, cell.y, cell.z, Blocks.id(&"water"))
+	check("simulation writes do not jump the mesh queue",
+		world._edit_dirty.is_empty())
+	world._edit_dirty.clear()
+	world.edit_block(cell.x, cell.y, cell.z, Blocks.AIR)
+	check("but the player's own edits do",
+		not world._edit_dirty.is_empty())
+
+
+## How many of an item are lying on the ground, across every drop.
+func _dropped_count(id: StringName) -> int:
+	var n := 0
+	for child in game.drops_root.get_children():
+		var d := child as ItemDrop
+		if d != null and d.stack != null and d.stack.id == id:
+			n += d.stack.count
+	return n
 
 
 ## How many of a cell's *own* outward faces the chunk mesh is still drawing.
